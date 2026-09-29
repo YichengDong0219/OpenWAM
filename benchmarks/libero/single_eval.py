@@ -200,6 +200,80 @@ class _VideoRecorder:
         self._writers.clear()
 
 
+
+def _paired_numeric_obs(obs: dict) -> dict:
+    result = {}
+    for key, value in obs.items():
+        if key.endswith("_image") or value is None:
+            continue
+        array = np.asarray(value)
+        if array.ndim <= 2 and np.issubdtype(array.dtype, np.number):
+            result[key] = array.astype(np.float64).tolist()
+    return result
+
+
+def _save_paired_rollout(
+    branch_env,
+    sim_state: np.ndarray,
+    generation: dict,
+    head_camera_key: str,
+    wrist_camera_key: str | None,
+    image_transform: str,
+    rollout_horizon: int,
+) -> None:
+    """Execute one generated chunk in an isolated env restored to the same MuJoCo state."""
+    directory = Path(generation["directory"])
+    actual_dir = directory / "actual"
+    actual_dir.mkdir(parents=True, exist_ok=True)
+    np.save(directory / "pre_action_sim_state.npy", sim_state)
+
+    # Reset Python-side controller state before installing the physical state.
+    branch_env.reset()
+    obs = branch_env.regenerate_obs_from_state(sim_state)
+    records = [{"offset": 0, "obs_numeric": _paired_numeric_obs(obs)}]
+
+    import imageio
+
+    imageio.imwrite(actual_dir / "frame_000_view.png", _display_frame(obs, head_camera_key, wrist_camera_key))
+    imageio.imwrite(
+        actual_dir / "frame_000_policy.png",
+        _policy_frame(obs, head_camera_key, wrist_camera_key, image_transform),
+    )
+    actions = np.asarray(generation["libero_action7"], dtype=np.float32)
+    count = min(int(rollout_horizon), int(generation["inference_horizon"]), len(actions))
+    for offset, action in enumerate(actions[:count], start=1):
+        obs, reward, done, info = branch_env.step(action)
+        records.append(
+            {
+                "offset": offset,
+                "reward": float(reward),
+                "done": bool(done),
+                "obs_numeric": _paired_numeric_obs(obs),
+            }
+        )
+        imageio.imwrite(
+            actual_dir / f"frame_{offset:03d}_view.png",
+            _display_frame(obs, head_camera_key, wrist_camera_key),
+        )
+        imageio.imwrite(
+            actual_dir / f"frame_{offset:03d}_policy.png",
+            _policy_frame(obs, head_camera_key, wrist_camera_key, image_transform),
+        )
+    (directory / "actual_rollout.json").write_text(
+        json.dumps(
+            {
+                "trial": generation["trial"],
+                "chunk_start_step": generation["chunk_start_step"],
+                "executed_actions": count,
+                "state_scope": "MuJoCo flattened state; branch controller is reset before restoration",
+                "records": records,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def run_eval(cfg: dict) -> int:
     if str(cfg.get("action_mode", "")).strip().lower() != "eef":
         raise ValueError("LIBERO runner requires action_mode: eef")
@@ -265,6 +339,28 @@ def run_eval(cfg: dict) -> int:
     head_camera_key = cfg.get("head_camera_key", "agentview_image")
     left_wrist_camera_key = cfg.get("left_wrist_camera_key", "robot0_eye_in_hand_image")
     image_transform = cfg.get("image_transform", "rotate_180")
+    debug_enabled = _require_bool(cfg.get("debug", False), "debug")
+    debug_dir = cfg.get("debug_dir", "./debug_libero")
+    paired_cfg = cfg.get("paired_rollout") or {}
+    if not isinstance(paired_cfg, dict):
+        raise TypeError("paired_rollout must be a YAML mapping")
+    paired_enabled = _require_bool(paired_cfg.get("enabled", False), "paired_rollout.enabled")
+    paired_decode_world = _require_bool(
+        paired_cfg.get("decode_world", True), "paired_rollout.decode_world"
+    )
+    paired_execute_branch = _require_bool(
+        paired_cfg.get("execute_branch", True), "paired_rollout.execute_branch"
+    )
+    paired_trials = {int(value) for value in paired_cfg.get("trials", [])}
+    paired_steps = {int(value) for value in paired_cfg.get("capture_steps", [])}
+    paired_rollout_horizon = int(paired_cfg.get("rollout_horizon", 10))
+    if paired_enabled and (not paired_trials or not paired_steps or paired_rollout_horizon <= 0):
+        raise ValueError("paired_rollout requires non-empty trials/capture_steps and positive rollout_horizon")
+    if debug_enabled and cfg.get("result_dir"):
+        # _maybe_debug names its dirs episode_NNN/step_MMMM starting from zero in every
+        # client, so a shared debug_dir would make concurrent tasks overwrite each other.
+        # Anchor it to this task's own result_dir instead.
+        debug_dir = Path(cfg["result_dir"]).expanduser().resolve() / "debug"
     save_video = _require_bool(cfg.get("save_video", False), "save_video")
     video_fps = int(cfg.get("video_fps", 30))
     video_dir = None
@@ -287,9 +383,24 @@ def run_eval(cfg: dict) -> int:
         action_dim=7,
         action_indices=cfg.get("action_indices"),
         action_clip=cfg.get("action_clip"),
-        debug=_require_bool(cfg.get("debug", False), "debug"),
-        debug_dir=cfg.get("debug_dir", "./debug_libero"),
+        debug=debug_enabled,
+        debug_dir=debug_dir,
+        paired_capture={
+            "enabled": paired_enabled,
+            "decode_world": paired_decode_world,
+            "trials": sorted(paired_trials),
+            "capture_steps": sorted(paired_steps),
+            "output_dir": str(Path(cfg["result_dir"]).expanduser().resolve() / "paired_rollouts")
+            if paired_enabled
+            else "./paired_rollouts",
+        },
     )
+    # Creating or stepping a second MuJoCo environment perturbs process-global
+    # simulator/random state. Defer every counterfactual until all main trials
+    # finish so diagnostic collection cannot alter the measured policy outcome.
+    branch_env = None
+    pending_paired_rollouts: list[tuple[np.ndarray, dict]] = []
+    captured_generations: list[dict] = []
 
     successes = 0
     trial_results = []
@@ -330,10 +441,15 @@ def run_eval(cfg: dict) -> int:
                     else:
                         with domain.activate():
                             obs, _, _, _ = env.step(settle_action)
-                policy.reset()
+                policy.reset(trial) if paired_enabled else policy.reset()
                 done = False
                 for step in range(max_steps):
                     action = policy.act(obs, task.language)
+                    generation = policy.pop_generation() if paired_enabled else None
+                    if generation is not None:
+                        captured_generations.append(generation)
+                        if paired_execute_branch:
+                            pending_paired_rollouts.append((env.get_sim_state().copy(), generation))
                     if domain is None:
                         obs, reward, done, _ = env.step(action)
                     else:
@@ -369,8 +485,33 @@ def run_eval(cfg: dict) -> int:
                         "successes": successes,
                     },
                 )
+        if captured_generations:
+            print(
+                f"[paired] replaying {len(captured_generations)} saved inputs after main evaluation",
+                flush=True,
+            )
+            for generation in captured_generations:
+                policy.decode_generation(generation)
+        if pending_paired_rollouts:
+            print(
+                f"[paired] replaying {len(pending_paired_rollouts)} saved chunks after main evaluation",
+                flush=True,
+            )
+            branch_env = _make_env_with_randomization_retries(task, cfg)
+            for sim_state, generation in pending_paired_rollouts:
+                _save_paired_rollout(
+                    branch_env,
+                    sim_state,
+                    generation,
+                    head_camera_key,
+                    left_wrist_camera_key,
+                    image_transform,
+                    paired_rollout_horizon,
+                )
     finally:
         env.close()
+        if branch_env is not None:
+            branch_env.close()
         policy.close()
 
     count = trial_stop - trial_start
@@ -397,6 +538,15 @@ def run_eval(cfg: dict) -> int:
             "video_fps": video_fps,
             "trials": trial_results,
         }
+        if paired_enabled:
+            result["paired_rollout"] = {
+                "enabled": True,
+                "decode_world": paired_decode_world,
+                "execute_branch": paired_execute_branch,
+                "trials": sorted(paired_trials),
+                "capture_steps": sorted(paired_steps),
+                "rollout_horizon": paired_rollout_horizon,
+            }
         if manifest is not None:
             result.update(
                 manifest_hash=manifest["manifest_hash"],

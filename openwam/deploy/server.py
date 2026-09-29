@@ -43,6 +43,8 @@ Usage:
 
 import argparse
 import asyncio
+import base64
+import io
 import json
 import logging
 import time
@@ -204,17 +206,42 @@ class PolicyServer:
         self._init_policy()
         t0 = time.monotonic()
 
+        capture_generation = obs.pop("capture_generation", False) is True
+        decode_generation = obs.pop("decode_generation", capture_generation) is True
         obs = self._obs_preprocessor.preprocess(obs)
-        action = self._policy.predict_action(obs)
+        if capture_generation:
+            obs["_decode_video"] = decode_generation
+        generation = None
+        if capture_generation:
+            action, generation = self._policy.predict_action_with_generation(obs)
+        else:
+            action = self._policy.predict_action(obs)
 
         latency_ms = (time.monotonic() - t0) * 1000
         self._request_count += 1
         self._total_latency += latency_ms
 
-        return {
+        response = {
             "action": action.tolist(),
             "step": self._request_count,
             "latency_ms": round(latency_ms, 2),
+        }
+        if generation is not None:
+            response["generation"] = self._serialize_generation(generation)
+        return response
+
+    @staticmethod
+    def _serialize_generation(generation: dict) -> dict:
+        """Serialize an opt-in joint generation without changing baseline replies."""
+        encoded_frames = []
+        for frame in generation.get("video") or []:
+            stream = io.BytesIO()
+            frame.save(stream, format="JPEG", quality=95)
+            encoded_frames.append(base64.b64encode(stream.getvalue()).decode("ascii"))
+        return {
+            "actions": generation["actions"].tolist(),
+            "inference_horizon": int(generation["inference_horizon"]),
+            "video_jpeg_b64": encoded_frames,
         }
 
     def reset(self):

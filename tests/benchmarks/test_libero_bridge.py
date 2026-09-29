@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import base64
+import json
+
 import numpy as np
 import pytest
 import yaml
@@ -99,3 +102,84 @@ def test_native_eef10_bridge_clips_runtime_command_directly() -> None:
 def test_policy_rejects_wrong_representation() -> None:
     with pytest.raises(RuntimeError, match="representation mismatch"):
         OpenWAMLiberoPolicy(_client=_Client("wrong_contract"))
+
+
+class _CaptureClient:
+    def __init__(self):
+        self.last_payload = None
+        self.payloads = []
+
+    def ping(self):
+        return {"type": "pong", "representation": LIBERO_ACTION_MODE}
+
+    def reset(self):
+        return {"type": "reset_ack"}
+
+    def predict(self, payload):
+        self.last_payload = payload
+        self.payloads.append(payload)
+        identity = [1, 0, 0, 0, 1, 0]
+        action = [0, 0, 0, *identity, 1]
+        response = {"action": action}
+        if payload.get("capture_generation") is True:
+            response["generation"] = {
+                "actions": [action, action],
+                "inference_horizon": 2,
+                "video_jpeg_b64": [base64.b64encode(b"jpeg-bytes").decode("ascii")],
+            }
+        return response
+
+    def close(self):
+        pass
+
+
+def test_paired_capture_is_opt_in_and_persists_generation(tmp_path) -> None:
+    client = _CaptureClient()
+    policy = OpenWAMLiberoPolicy(
+        _client=client,
+        paired_capture={
+            "enabled": True,
+            "trials": [2],
+            "capture_steps": [0],
+            "output_dir": str(tmp_path),
+        },
+    )
+    policy.reset(2)
+    obs = {
+        "agentview_image": np.zeros((256, 256, 3), dtype=np.uint8),
+        "robot0_eye_in_hand_image": np.zeros((256, 256, 3), dtype=np.uint8),
+        "robot0_eef_pos": np.zeros(3),
+        "robot0_eef_quat": np.array([1, 0, 0, 0]),
+        "robot0_gripper_qpos": np.zeros(2),
+    }
+    policy.act(obs, "lift the bowl")
+    generation = policy.pop_generation()
+
+    assert "capture_generation" not in client.payloads[0]
+    assert generation is not None
+    policy.decode_generation(generation)
+
+    assert client.payloads[1]["capture_generation"] is True
+    assert client.payloads[1]["decode_generation"] is True
+    assert generation["libero_action7"].shape == (2, 7)
+    directory = tmp_path / "trial_002" / "step_0000"
+    assert (directory / "predicted/frame_000.jpg").read_bytes() == b"jpeg-bytes"
+    metadata = json.loads((directory / "generation.json").read_text())
+    assert metadata["predicted_frame_count"] == 1
+    assert metadata["inference_horizon"] == 2
+    assert metadata["replay_first_action_matches_online_exactly"] is True
+
+
+def test_default_policy_request_does_not_enable_capture() -> None:
+    client = _CaptureClient()
+    policy = OpenWAMLiberoPolicy(_client=client)
+    policy.reset()
+    obs = {
+        "agentview_image": np.zeros((256, 256, 3), dtype=np.uint8),
+        "robot0_eye_in_hand_image": np.zeros((256, 256, 3), dtype=np.uint8),
+        "robot0_eef_pos": np.zeros(3),
+        "robot0_eef_quat": np.array([1, 0, 0, 0]),
+        "robot0_gripper_qpos": np.zeros(2),
+    }
+    policy.act(obs, "lift the bowl")
+    assert "capture_generation" not in client.last_payload

@@ -82,3 +82,22 @@ def test_projection_missing_architecture_is_noop():
     engine.architecture = None
     policy = _policy(engine)
     assert policy.predict_action({})[MODE] == pytest.approx(-0.4)
+
+
+def test_opt_in_generation_capture_returns_fresh_chunk_once():
+    actions = _chunk(4, +0.2)
+    video = [object()]
+    engine = _FakeEngine([actions])
+    engine.generate = lambda conditions: {"actions": actions.copy(), "video": video}
+    policy = _policy(engine, inference_horizon=2)
+
+    first, generation = policy.predict_action_with_generation({})
+    second, buffered = policy.predict_action_with_generation({})
+
+    assert generation is not None
+    assert generation["video"] is video
+    assert generation["inference_horizon"] == 2
+    assert generation["actions"].shape == actions.shape
+    assert buffered is None
+    np.testing.assert_array_equal(first, actions[0])
+    np.testing.assert_array_equal(second, actions[1])

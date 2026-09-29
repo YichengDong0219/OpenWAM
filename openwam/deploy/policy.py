@@ -61,6 +61,22 @@ class WAMPolicy:
         downstream command contract for the WS server and direct consumers.
         """
         action = self._executor.predict_action(self._build_conditions(obs))
+        return self._project_binary_commands(action)
+
+    def predict_action_with_generation(self, obs: dict) -> tuple[np.ndarray, dict | None]:
+        """Opt-in paired world/action capture for synchronous research runs."""
+        method = getattr(self._executor, "predict_action_with_generation", None)
+        if method is None:
+            raise RuntimeError("paired generation capture currently requires synchronous inference")
+        action, generation = method(self._build_conditions(obs))
+        action = self._project_binary_commands(action)
+        if generation is not None:
+            generation = dict(generation)
+            generation["actions"] = self._project_binary_commands(generation["actions"])
+        return action, generation
+
+    def _project_binary_commands(self, action: np.ndarray) -> np.ndarray:
+        """Project declared two-point command dimensions on one action or a chunk."""
         dims = getattr(getattr(self.engine, "architecture", None), "binary_command_dims", ()) or ()
         if dims:
             action = np.array(action)
@@ -99,4 +115,6 @@ class WAMPolicy:
             conditions["prompt"] = obs["prompt"]
         if "state" in obs and obs["state"] is not None:
             conditions["proprio"] = obs["state"]
+        if "_decode_video" in obs:
+            conditions["decode_video"] = bool(obs["_decode_video"])
         return conditions

@@ -1,0 +1,49 @@
+# Opt-in paired world/action diagnostic for LIBERO spatial task 05.
+# Standard policy_config.yml remains unchanged.
+policy_name: openwam_libero
+host: "127.0.0.1"
+port: 8848
+request_timeout: 300
+
+suite: libero_spatial
+task_id: 5
+num_trials: 50
+max_steps: 600
+max_steps_by_suite:
+  libero_spatial: 600
+  libero_object: 600
+  libero_goal: 600
+  libero_10: 700
+seed: 42
+rng_mode: environment
+reseed_each_trial: false
+fail_on_incomplete: false
+
+settle_steps: 30
+settle_action: [0, 0, 0, 0, 0, 0, -1]
+
+camera_height: 256
+camera_width: 256
+head_camera_key: agentview_image
+left_wrist_camera_key: robot0_eye_in_hand_image
+right_wrist_camera_key: null
+image_transform: rotate_180
+
+action_mode: eef
+state_dim: 10
+send_state: true
+action_indices: null
+action_clip: null
+
+debug: false
+result_dir: "./evaluate_results/libero"
+
+paired_rollout:
+  enabled: true
+  decode_world: true
+  execute_branch: true
+  # Failures observed in the reference launch plus nearby successful controls.
+  trials: [0, 2, 8, 21, 26, 30, 41, 44]
+  # Chunk starts spanning approach, close, lift, and immediate aftermath.
+  capture_steps: [20, 30, 40, 50, 60]
+  rollout_horizon: 10

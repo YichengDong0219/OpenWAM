@@ -39,6 +39,7 @@ class SyncInferenceExecutor:
         self.inference_horizon = inference_horizon
 
         self._action_buffer: deque = deque()
+        self._last_generation: Optional[dict] = None
 
     def predict_action(self, conditions: dict) -> np.ndarray:
         """Pop the next action, regenerating after the configured horizon."""
@@ -47,6 +48,19 @@ class SyncInferenceExecutor:
 
         action = self._action_buffer.popleft()
         return action
+
+    def predict_action_with_generation(self, conditions: dict) -> tuple[np.ndarray, Optional[dict]]:
+        """Return the next action and a fresh joint generation when replanning.
+
+        This opt-in research hook leaves predict_action unchanged. The
+        generation payload is returned only on the first action of a newly
+        generated chunk, so buffered steps do not duplicate video data.
+        """
+        generated = len(self._action_buffer) == 0
+        if generated:
+            self._generate_and_enqueue(conditions)
+        action = self._action_buffer.popleft()
+        return action, self._last_generation if generated else None
 
     def _generate_and_enqueue(self, conditions: dict):
         """Run inference and keep only the executable action horizon."""
@@ -65,10 +79,16 @@ class SyncInferenceExecutor:
 
         self._action_buffer.clear()
         self._action_buffer.extend(actions[:inference_horizon])
+        self._last_generation = {
+            "actions": np.asarray(actions).copy(),
+            "video": result.get("video"),
+            "inference_horizon": inference_horizon,
+        }
 
     def reset(self):
         """Clear state between episodes."""
         self._action_buffer.clear()
+        self._last_generation = None
 
     def shutdown(self):
         """No background resources; present for executor-interface symmetry."""

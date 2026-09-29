@@ -353,7 +353,7 @@ class JointInferenceEngine(BaseInferenceEngine):
                 "num_inference_steps": denoise_steps,
                 "shift": shift,
                 "dit_cache": self._dit_cache,
-                "decode_video": self._decode_video,
+                "decode_video": conditions.get("decode_video", self._decode_video),
                 "profile": self._profile,
                 "vace_cache": self._vace_cache,
                 "prompt_embed_cache": self._prompt_embed_cache,
