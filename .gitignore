@@ -51,6 +51,10 @@ third_party/**/__pycache__/
 third_party/**/build/
 third_party/**/dist/
 third_party/**/*.egg-info/
+# LIBERO is checked out here at the commit pinned by
+# benchmarks/libero/setup_env.sh. It is a plain clone (not a submodule)
+# carrying its own .git and multi-GB assets, so keep it out of this repo.
+third_party/LIBERO/
 *.egg-info/
 .installed.cfg
 *.egg

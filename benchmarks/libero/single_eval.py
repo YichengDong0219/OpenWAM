@@ -121,6 +121,85 @@ def _make_env_with_randomization_retries(task, cfg: dict, max_attempts: int = 5)
     raise AssertionError("unreachable")
 
 
+def _display_frame(obs: dict, head_key: str, wrist_key):
+    """A human-viewable frame in LIBERO's own orientation convention.
+
+    MuJoCo camera images arrive vertically flipped; LIBERO undoes that with
+    ``[::-1]`` both in ``libero/libero/utils/video_utils.py`` and in
+    ``benchmark_scripts/render_single_task.py``. Head and wrist are placed side
+    by side so grasp failures are readable.
+    """
+    panels = []
+    for key in (head_key, wrist_key):
+        value = obs.get(key) if key else None
+        if value is None:
+            continue
+        panels.append(np.ascontiguousarray(np.asarray(value)[::-1]))
+    if not panels:
+        return None
+    return np.concatenate(panels, axis=1) if len(panels) > 1 else panels[0]
+
+
+def _policy_frame(obs: dict, head_key: str, wrist_key, image_transform: str):
+    """The exact pixels the policy receives, for eyeballing model input.
+
+    Mirrors ``OpenWAMLiberoPolicy._maybe_encode``: ``image_transform`` is applied
+    to the raw obs first, then the LANCZOS resize into the training reader's
+    L-shape tile sizes. Head (320x256) and wrist (160x128) keep their native
+    sizes on a head-height canvas so the true input resolution stays visible.
+    """
+    from benchmarks.utils import resize_for_lshape_slot
+
+    head = obs.get(head_key) if head_key else None
+    if head is None:
+        return None
+    rotated = np.asarray(head)
+    if image_transform == "rotate_180":
+        rotated = rotated[::-1, ::-1]
+    canvas = resize_for_lshape_slot(rotated, "head_camera")
+    wrist = obs.get(wrist_key) if wrist_key else None
+    if wrist is None:
+        return canvas
+    tile_source = np.asarray(wrist)
+    if image_transform == "rotate_180":
+        tile_source = tile_source[::-1, ::-1]
+    tile = resize_for_lshape_slot(tile_source, "left_wrist_camera")
+    height, width = canvas.shape[:2]
+    tile_height, tile_width = tile.shape[:2]
+    padded = np.zeros((height, width + tile_width, 3), dtype=np.uint8)
+    padded[:, :width] = canvas
+    top = (height - tile_height) // 2
+    padded[top : top + tile_height, width:] = tile
+    return padded
+
+
+class _VideoRecorder:
+    """Streams one mp4 per (trial, kind); writers open lazily on first frame."""
+
+    def __init__(self, directory: Path, trial: int, fps: int) -> None:
+        self._directory = directory
+        self._trial = trial
+        self._fps = fps
+        self._writers: dict = {}
+
+    def append(self, kind: str, frame) -> None:
+        if frame is None:
+            return
+        writer = self._writers.get(kind)
+        if writer is None:
+            import imageio
+
+            path = self._directory / f"trial_{self._trial:03d}_{kind}.mp4"
+            writer = imageio.get_writer(str(path), fps=self._fps)
+            self._writers[kind] = writer
+        writer.append_data(frame)
+
+    def close(self) -> None:
+        for writer in self._writers.values():
+            writer.close()
+        self._writers.clear()
+
+
 def run_eval(cfg: dict) -> int:
     if str(cfg.get("action_mode", "")).strip().lower() != "eef":
         raise ValueError("LIBERO runner requires action_mode: eef")
@@ -183,15 +262,26 @@ def run_eval(cfg: dict) -> int:
     env = _make_env_with_randomization_retries(task, cfg)
     if manifest is None and not reseed_each_trial:
         env.seed(seed)
+    head_camera_key = cfg.get("head_camera_key", "agentview_image")
+    left_wrist_camera_key = cfg.get("left_wrist_camera_key", "robot0_eye_in_hand_image")
+    image_transform = cfg.get("image_transform", "rotate_180")
+    save_video = _require_bool(cfg.get("save_video", False), "save_video")
+    video_fps = int(cfg.get("video_fps", 30))
+    video_dir = None
+    if save_video:
+        if not cfg.get("result_dir"):
+            raise ValueError("save_video requires result_dir")
+        video_dir = Path(cfg["result_dir"]).expanduser().resolve() / "rollouts"
+        video_dir.mkdir(parents=True, exist_ok=True)
     policy = OpenWAMLiberoPolicy(
         host=cfg.get("host", "127.0.0.1"),
         port=int(cfg.get("port", 8848)),
         request_timeout=int(cfg.get("request_timeout", 300)),
         action_mode=cfg["action_mode"],
-        head_camera_key=cfg.get("head_camera_key", "agentview_image"),
-        left_wrist_camera_key=cfg.get("left_wrist_camera_key", "robot0_eye_in_hand_image"),
+        head_camera_key=head_camera_key,
+        left_wrist_camera_key=left_wrist_camera_key,
         right_wrist_camera_key=cfg.get("right_wrist_camera_key"),
-        image_transform=cfg.get("image_transform", "rotate_180"),
+        image_transform=image_transform,
         send_state=_require_bool(cfg.get("send_state", True), "send_state"),
         state_dim=int(cfg.get("state_dim", 10)),
         action_dim=7,
@@ -221,6 +311,7 @@ def run_eval(cfg: dict) -> int:
             result = {"trial": trial, "success": False, "policy_steps": 0}
             if entry is not None:
                 result["init_state_index"] = entry["init_state_index"]
+            recorder = None if video_dir is None else _VideoRecorder(video_dir, trial, video_fps)
             try:
                 if domain is None:
                     obs = env.reset()
@@ -248,6 +339,12 @@ def run_eval(cfg: dict) -> int:
                     else:
                         with domain.activate():
                             obs, reward, done, _ = env.step(action)
+                    if recorder is not None:
+                        recorder.append("view", _display_frame(obs, head_camera_key, left_wrist_camera_key))
+                        recorder.append(
+                            "policy",
+                            _policy_frame(obs, head_camera_key, left_wrist_camera_key, image_transform),
+                        )
                     result["policy_steps"] = step + 1
                     result["last_reward"] = float(reward)
                     if done:
@@ -255,6 +352,8 @@ def run_eval(cfg: dict) -> int:
                         result["success"] = True
                         break
             finally:
+                if recorder is not None:
+                    recorder.close()
                 trial_results.append(result)
             details = f"trial={trial} success={result['success']} steps={result['policy_steps']}"
             if entry is not None:
@@ -294,6 +393,8 @@ def run_eval(cfg: dict) -> int:
             "max_steps": max_steps,
             "settle_steps": settle_steps,
             "seed": seed,
+            "save_video": save_video,
+            "video_fps": video_fps,
             "trials": trial_results,
         }
         if manifest is not None:
