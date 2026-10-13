@@ -1,0 +1,253 @@
+"""G0 offline probe runner (M4): rebuild a generation from a recorded trace without a server.
+
+Python API (used by G1/G2):
+    runner = OfflineRunner(ckpt_dir, config)
+    trace = load_trace(path)
+    out = runner.rerun(trace, video_seed=..., action_seed=..., replay=donor_trace)   # full chunk
+    vel = runner.step_response(trace, i, video_latents=...)                          # one forward
+
+CLI:
+    python scripts/probe/offline_runner.py check --ckpt-dir CK --trace T.pt [--record R/record.json]
+
+``check`` reports, for one trace:
+  * receipt   -- trace sha256 equals the client record's probe receipt (when --record is given)
+  * first_frame -- recomputed first-frame latents vs the recorded ones
+  * rerun     -- offline full-chunk regeneration vs the online ``final.actions_physical``
+                 (cross-process reproducibility; online server and this process differ)
+  * step_noop -- per denoising step, recomputed action velocity from the recorded inputs vs the
+                 recorded action velocity (no intervention)
+  * isolated  -- path-blocking check: perturb only the future video latents at one step and
+                 compare the action-velocity change under the checkpoint's own mask and under a
+                 temporarily rebuilt ``isolated`` mask (action sees only the first frame)
+Numbers are reported, not judged: the no-op tolerance comes from the V0 suite.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
+
+
+def load_trace(path) -> dict:
+    trace = torch.load(path, map_location="cpu", weights_only=False)
+    if trace.get("meta", {}).get("format") != "openwam-g0-probe-trace/1":
+        raise ValueError(f"{path} is not an openwam-g0-probe-trace/1 file")
+    return trace
+
+
+def sha256_file(path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _maxabs(a, b) -> float:
+    a = torch.as_tensor(np.asarray(a) if not torch.is_tensor(a) else a).float()
+    b = torch.as_tensor(np.asarray(b) if not torch.is_tensor(b) else b).float()
+    return float((a - b).abs().max())
+
+
+class OfflineRunner:
+    def __init__(self, ckpt_dir: str, config: str | None = None, device: str = "cuda"):
+        from openwam.deploy.server import _build_argparser, build_server_from_config, resolve_deploy_args
+
+        config = config or str(REPO / "configs" / "deploy_probe.yaml")
+        args = _build_argparser().parse_args(["--config", config, "--ckpt-dir", ckpt_dir])
+        cfg, ckpt = resolve_deploy_args(args)
+        self.server = build_server_from_config(cfg=cfg, ckpt_dir=ckpt, device=device, ckpt_name=None,
+                                               readiness_token=None)
+        self.engine = self.server.engine
+        self.arch = self.engine.architecture
+        if self.engine._dit_cache is not None:
+            raise ValueError("offline probe runner requires dit_cache disabled (use configs/deploy_probe.yaml)")
+
+    # -- condition reconstruction -------------------------------------------------------------
+    def _shift(self) -> float:
+        ab = getattr(self.arch, "action_backbone", None)
+        shift = getattr(ab, "shift_action", None) if ab is not None else None
+        return 5.0 if shift is None else float(shift)
+
+    def generate_kwargs(self, trace: dict, *, video_seed=None, action_seed=None) -> dict:
+        meta, cond = trace["meta"], trace["cond"]
+        image = cond["image"]
+        if image is None:
+            raise ValueError("trace has no conditioning image")
+        return {
+            "schedule": [tuple(x) for x in meta["schedule"]],
+            "prompt": cond["prompt"],
+            "first_frame_image": [Image.fromarray(np.asarray(image, dtype=np.uint8))],
+            "num_frames": int(meta["num_frames"]),
+            "action_num_frames": int(meta["action_num_frames"]),
+            "height": int(image.shape[0]),
+            "width": int(image.shape[1]),
+            "seed": int(meta["seed"]),
+            "video_seed": int(meta["video_seed"] if video_seed is None else video_seed),
+            "action_seed": int(meta["action_seed"] if action_seed is None else action_seed),
+            "tiled": True,
+            "num_inference_steps": int(meta["denoise_steps"]),
+            "shift": self._shift(),
+            "dit_cache": None,
+            "decode_video": False,
+            "vace_cache": {},
+            "prompt_embed_cache": None,
+            "proprio": cond.get("proprio"),
+        }
+
+    def _inputs_shared(self, trace: dict, video_seed=None) -> dict:
+        """Mirror the preprocessing at the top of ``BaseWAMArchitecture.generate``."""
+        kw = self.generate_kwargs(trace, video_seed=video_seed)
+        arch, vb = self.arch, self.arch.video_backbone
+        inputs = vb.preprocess_input_for_inference(
+            prompt=kw["prompt"], vace_video=None, first_frame_image=kw["first_frame_image"],
+            num_frames=kw["num_frames"], height=kw["height"], width=kw["width"], seed=kw["video_seed"],
+            num_inference_steps=kw["num_inference_steps"], shift=kw["shift"], tiled=True, vace_cache={},
+            prompt_embed_cache=None, cfg_scale=1.0, cfg_merge=False,
+        )
+        if arch.uses_proprioception:
+            inputs["proprio"] = kw["proprio"].to(device=arch.device, dtype=arch.dtype)
+        return inputs
+
+    # -- full chunk ----------------------------------------------------------------------------
+    @torch.no_grad()
+    def rerun(self, trace: dict, *, video_seed=None, action_seed=None, replay: dict | None = None,
+              record: bool = True) -> dict:
+        kw = self.generate_kwargs(trace, video_seed=video_seed, action_seed=action_seed)
+        probe = {"record": record}
+        if replay is not None:
+            probe["replay_video_steps"] = {int(s["i"]): s["video_latents_in"] for s in replay["steps"]}
+            probe["replay_t_v"] = {int(s["i"]): float(s["t_v"]) for s in replay["steps"]}
+            probe["replay_video_final"] = replay["final"]["video_latents"]
+        return self.arch.generate(**kw, probe=probe)
+
+    # -- single step -----------------------------------------------------------------------------
+    @torch.no_grad()
+    def step_response(self, trace: dict, i: int, *, video_latents=None, action_latents=None,
+                      inputs_shared: dict | None = None):
+        """One joint forward at recorded step ``i``; returns (video_velocity, action_velocity).
+
+        ``video_latents`` replaces the video stream entering the step (the first frame is always
+        reset to this trace's own first-frame latents); ``action_latents`` defaults to the recorded
+        action state, so only the video side changes.
+        """
+        arch = self.arch
+        step = next(s for s in trace["steps"] if int(s["i"]) == int(i))
+        inputs = dict(inputs_shared) if inputs_shared is not None else self._inputs_shared(trace)
+        lat = (step["video_latents_in"] if video_latents is None else video_latents)
+        lat = lat.to(device=arch.device, dtype=inputs["latents"].dtype).clone()
+        ref = inputs.get("first_frame_latents")
+        if ref is not None:
+            lat[:, :, : ref.shape[2]] = ref
+        inputs["latents"] = lat
+        al = (step["action_latents_in"] if action_latents is None else action_latents)
+        al = al.to(device=arch.device, dtype=arch.dtype)
+        v_t = torch.tensor([step["t_v"]], dtype=arch.dtype, device=arch.device)
+        a_t = torch.tensor([step["t_a"]], dtype=arch.dtype, device=arch.device)
+        torch.compiler.cudagraph_mark_step_begin()
+        video_vel, action_vel = arch.forward(al, a_t, **inputs, timestep=v_t)
+        return video_vel.detach().cpu(), action_vel.detach().cpu()
+
+    @contextlib.contextmanager
+    def attention_mask_mode(self, mode: str):
+        """Temporarily rebuild the MoT driver with another cross-modal mask (path-blocking checks)."""
+        arch = self.arch
+        kwargs = getattr(arch, "_mot_driver_kwargs", None)
+        if kwargs is None or "attention_mask_mode" not in kwargs:
+            raise ValueError(f"{type(arch).__name__} does not expose a rebuildable attention_mask_mode")
+        old_mode, old_driver = kwargs["attention_mask_mode"], arch._mot_driver
+        kwargs["attention_mask_mode"] = mode
+        arch._mot_driver = None
+        arch.build_mot_driver()
+        try:
+            yield
+        finally:
+            kwargs["attention_mask_mode"] = old_mode
+            arch._mot_driver = old_driver if old_driver is not None else None
+            if arch._mot_driver is None:
+                arch.build_mot_driver()
+
+
+def check(runner: OfflineRunner, trace_path: str, record_path: str | None, isolated_step: int | None) -> dict:
+    trace = load_trace(trace_path)
+    report: dict = {"trace": str(trace_path), "trace_sha256": sha256_file(trace_path),
+                    "mask_mode": getattr(runner.arch, "_mot_driver_kwargs", {}).get("attention_mask_mode")}
+    if record_path:
+        record = json.loads(Path(record_path).read_text())
+        receipt = record.get("probe_receipt") or {}
+        report["receipt_sha_match"] = receipt.get("sha256") == report["trace_sha256"]
+        report["receipt_path_match"] = os.path.realpath(receipt.get("trace_path", "")) == os.path.realpath(trace_path)
+        report["record_actions_vs_trace_maxabs"] = _maxabs(record["actions"], trace["final"]["actions_returned"])
+
+    inputs = runner._inputs_shared(trace)
+    ref = inputs.get("first_frame_latents")
+    rec_ref = trace["cond"].get("first_frame_latents")
+    if ref is not None and rec_ref is not None:
+        report["first_frame_latents_maxabs"] = _maxabs(ref.cpu(), rec_ref)
+
+    out = runner.rerun(trace)
+    report["rerun_actions_maxabs"] = _maxabs(out["actions"], trace["final"]["actions_physical"])
+    report["rerun_step_action_vel_maxabs"] = max(
+        _maxabs(a["action_velocity"], b["action_velocity"])
+        for a, b in zip(out["probe_trace"]["steps"], trace["steps"])
+    )
+
+    noop = []
+    for s in trace["steps"]:
+        _, av = runner.step_response(trace, s["i"], inputs_shared=inputs)
+        noop.append(_maxabs(av, s["action_velocity"]))
+    report["step_noop_action_vel_maxabs"] = noop
+
+    if isolated_step is not None:
+        s = next(x for x in trace["steps"] if int(x["i"]) == isolated_step)
+        g = torch.Generator().manual_seed(1234)
+        perturbed = s["video_latents_in"].clone()
+        perturbed[:, :, 1:] = torch.randn(perturbed[:, :, 1:].shape, generator=g).to(perturbed.dtype)
+        _, base = runner.step_response(trace, isolated_step, inputs_shared=inputs)
+        _, pert = runner.step_response(trace, isolated_step, video_latents=perturbed, inputs_shared=inputs)
+        report["future_perturb_action_vel_maxabs_own_mask"] = _maxabs(base, pert)
+        with runner.attention_mask_mode("isolated"):
+            _, base_i = runner.step_response(trace, isolated_step, inputs_shared=inputs)
+            _, pert_i = runner.step_response(trace, isolated_step, video_latents=perturbed, inputs_shared=inputs)
+        report["future_perturb_action_vel_maxabs_isolated"] = _maxabs(base_i, pert_i)
+        report["isolated_step"] = isolated_step
+    return report
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check")
+    c.add_argument("--ckpt-dir", required=True)
+    c.add_argument("--config", default=None)
+    c.add_argument("--trace", required=True, nargs="+")
+    c.add_argument("--record", nargs="*", default=None, help="client record.json per trace (same order)")
+    c.add_argument("--isolated-step", type=int, default=5)
+    c.add_argument("--out", default=None)
+    args = p.parse_args(argv)
+
+    runner = OfflineRunner(args.ckpt_dir, args.config)
+    records = args.record or [None] * len(args.trace)
+    if len(records) != len(args.trace):
+        raise SystemExit("--record must match --trace in length")
+    reports = [check(runner, t, r, args.isolated_step) for t, r in zip(args.trace, records)]
+    text = json.dumps(reports, indent=1)
+    print(text)
+    if args.out:
+        Path(args.out).write_text(text + "\n")
+
+
+if __name__ == "__main__":
+    main()
