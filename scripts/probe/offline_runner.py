@@ -70,6 +70,7 @@ class OfflineRunner:
         cfg, ckpt = resolve_deploy_args(args)
         self.server = build_server_from_config(cfg=cfg, ckpt_dir=ckpt, device=device, ckpt_name=None,
                                                readiness_token=None)
+        self.server._init_policy()  # builds the ObsPreprocessor used by inputs_from_record()
         self.engine = self.server.engine
         self.arch = self.engine.architecture
         if self.engine._dit_cache is not None:
