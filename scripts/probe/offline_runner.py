@@ -248,6 +248,21 @@ def check(runner: OfflineRunner, trace_path: str, record_path: str | None, isola
         for a, b in zip(out["probe_trace"]["steps"], trace["steps"])
     )
 
+    # Fail-closed replay validation: incompatible source traces must raise, never be cast.
+    negatives = {}
+    bad_dtype = {**trace, "steps": [dict(x) for x in trace["steps"]]}
+    bad_dtype["steps"][0]["video_latents_in"] = bad_dtype["steps"][0]["video_latents_in"].float()
+    bad_ta = {**trace, "meta": {**trace["meta"], "schedule": [list(x) for x in trace["meta"]["schedule"]]}}
+    bad_ta["meta"]["schedule"][1][1] += 1.0
+    for name, bad in (("video_dtype_float32", bad_dtype), ("action_timestep_plus1", bad_ta)):
+        try:
+            runner.rerun(trace, replay=bad, record=False)
+            negatives[name] = "NOT RAISED"
+        except ValueError as exc:
+            negatives[name] = f"rejected: {exc}"
+    report["replay_negative_cases"] = negatives
+    report["replay_negatives_all_rejected"] = all(v.startswith("rejected") for v in negatives.values())
+
     noop = []
     for s in trace["steps"]:
         _, av = runner.step_response(trace, s["i"], inputs_shared=inputs)

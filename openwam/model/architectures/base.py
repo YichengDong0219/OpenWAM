@@ -1763,6 +1763,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 raise ValueError(
                     f"probe replay latent shape {tuple(steps[i].shape)} != live {tuple(live_latents.shape)} at step {i}"
                 )
+            if steps[i].dtype != live_latents.dtype:
+                raise ValueError(f"probe replay latent dtype {steps[i].dtype} != live {live_latents.dtype} at step {i}")
+        final = probe.get("replay_video_final")
+        if final is not None:
+            if tuple(final.shape) != tuple(live_latents.shape) or final.dtype != live_latents.dtype:
+                raise ValueError(
+                    f"probe replay final latents {tuple(final.shape)}/{final.dtype} incompatible with live "
+                    f"{tuple(live_latents.shape)}/{live_latents.dtype}"
+                )
 
     # --- §15: Classifier-Free Guidance helpers (inference-time) ---
 
