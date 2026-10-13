@@ -151,13 +151,13 @@ def main():
         record = json.loads(args.record.read_text())
         base = payload_from_record(record)
         with WSPolicyClient(args.url, timeout=600) as ws:
-            def generate(name, *, probe=True, seeds=False, replay=None):
+            def generate(name, *, probe=True, seeds=False, replay=None, video_seed=None, action_seed=None):
                 ws.reset()
                 payload = copy.deepcopy(base)
                 path = out / f"{name}.pt"
                 if probe:
-                    payload["probe"] = {"trace_path": str(path), "video_seed": 42 if seeds else None,
-                        "action_seed": 42 if seeds else None, "replay_trace_path": str(replay) if replay else None,
+                    payload["probe"] = {"trace_path": str(path), "video_seed": 42 if seeds else video_seed,
+                        "action_seed": 42 if seeds else action_seed, "replay_trace_path": str(replay) if replay else None,
                         "replay_mode": "self" if replay else None}
                 else:
                     payload.update(capture_generation=True, decode_generation=False)
@@ -182,6 +182,15 @@ def main():
                 "trace_bytes": repeated[0][1]["bytes"]}
             explicit, _ = generate("explicit_defaults", seeds=True)
             report["checks"]["V1_explicit_defaults"] = compare_traces(traces[0], explicit, tolerance)
+            video_changed, _ = generate("video_seed_only", video_seed=7)
+            action_changed, _ = generate("action_seed_only", action_seed=7)
+            independent = {
+                "video_seed_keeps_action_noise": torch.equal(traces[0]["init"]["action_noise"], video_changed["init"]["action_noise"]),
+                "video_seed_changes_video_noise": not torch.equal(traces[0]["init"]["video_noise"], video_changed["init"]["video_noise"]),
+                "action_seed_keeps_video_noise": torch.equal(traces[0]["init"]["video_noise"], action_changed["init"]["video_noise"]),
+                "action_seed_changes_action_noise": not torch.equal(traces[0]["init"]["action_noise"], action_changed["init"]["action_noise"]),
+            }
+            report["checks"]["V1_seed_independence"] = {**independent, "passed": all(independent.values())}
             replayed, _ = generate("self_replay", replay=out / "repeat0.pt")
             report["checks"]["V3_self_replay"] = compare_traces(traces[0], replayed, tolerance)
             _, off = generate("capture_off", probe=False)
@@ -192,6 +201,22 @@ def main():
             report["checks"]["V5_same_input_capture_on_off"] = {**measured, "atol": allowed,
                 "passed": measured["max_abs"] <= allowed and measured_on["max_abs"] <= allowed,
                 "online_record_reproduction": {**measured_on, "passed": measured_on["max_abs"] <= allowed}}
+            negative = {}
+            for name, alter in (
+                ("action_timestep", lambda t: t["meta"]["schedule"].__setitem__(0, (t["meta"]["schedule"][0][0], t["meta"]["schedule"][0][1] + 1))),
+                ("video_dtype", lambda t: t["steps"][0].__setitem__("video_latents_in", t["steps"][0]["video_latents_in"].float())),
+            ):
+                invalid = copy.deepcopy(traces[0])
+                alter(invalid)
+                source = out / f"invalid_{name}.pt"
+                torch.save(invalid, source)
+                try:
+                    generate(f"reject_{name}", replay=source)
+                except client.ServerError as exc:
+                    negative[name] = {"passed": True, "server_error": str(exc)}
+                else:
+                    negative[name] = {"passed": False, "error": "incompatible replay was accepted"}
+            report["checks"]["V3_replay_rejects_invalid_inputs"] = {"passed": all(x["passed"] for x in negative.values()), "cases": negative}
         report["passed"] = all(v["passed"] for v in report["checks"].values())
     except Exception as exc:
         report.update(passed=False, error=f"{type(exc).__name__}: {exc}")
