@@ -76,6 +76,43 @@ class OfflineRunner:
         if self.engine._dit_cache is not None:
             raise ValueError("offline probe runner requires dit_cache disabled (use configs/deploy_probe.yaml)")
 
+    # -- memory: GPU-exact prompt embeddings, then text encoder off the GPU ---------------------
+    @torch.no_grad()
+    def precompute_prompts(self, prompts, offload_text_encoder: bool = True) -> dict:
+        """Encode ``prompts`` on the GPU exactly as the online server does, cache them in the engine's
+        prompt cache, then (optionally) park the text encoder on the CPU to free ~11 GB.
+
+        To make room on a shared GPU the video DiT is moved to CPU only while encoding and restored
+        afterwards, so the embeddings are numerically identical to the online path. Once the text
+        encoder is on CPU, an un-cached prompt fails loudly (device mismatch) instead of silently taking
+        a different numeric path.
+        """
+        from openwam.model.video_backbone.wan import encode as wan_encode
+
+        cache = self.engine._prompt_embed_cache
+        if cache is None:
+            raise ValueError("deploy config disables prompt_embed_cache; enable it for the offline runner")
+        vb, device = self.arch.video_backbone, self.arch.device
+        todo = [p for p in dict.fromkeys(prompts) if p not in cache]
+        if todo:
+            if len(todo) > getattr(cache, "_maxsize", 32):
+                raise ValueError(f"{len(todo)} prompts exceed the prompt cache size")
+            if next(vb.text_encoder.parameters()).device.type != "cuda":
+                raise RuntimeError("text encoder already offloaded; cannot encode new prompts")
+            vb.dit.to("cpu")
+            torch.cuda.empty_cache()
+            try:
+                for p in todo:
+                    wan_encode.encode_text_for_inference(p, vace_cache=None, prompt_embed_cache=cache,
+                                                         tokenizer=vb._tokenizer, text_encoder=vb.text_encoder,
+                                                         device=device)
+            finally:
+                vb.dit.to(device)
+        if offload_text_encoder:
+            vb.text_encoder.to("cpu")
+            torch.cuda.empty_cache()
+        return {"encoded": len(todo), "cached": len(cache), "text_encoder_offloaded": bool(offload_text_encoder)}
+
     # -- condition reconstruction -------------------------------------------------------------
     def _shift(self) -> float:
         ab = getattr(self.arch, "action_backbone", None)
@@ -104,7 +141,7 @@ class OfflineRunner:
             "dit_cache": None,
             "decode_video": False,
             "vace_cache": {},
-            "prompt_embed_cache": None,
+            "prompt_embed_cache": self.engine._prompt_embed_cache,
             "proprio": cond.get("proprio"),
         }
 
@@ -116,7 +153,7 @@ class OfflineRunner:
             prompt=kw["prompt"], vace_video=None, first_frame_image=kw["first_frame_image"],
             num_frames=kw["num_frames"], height=kw["height"], width=kw["width"], seed=kw["video_seed"],
             num_inference_steps=kw["num_inference_steps"], shift=kw["shift"], tiled=True, vace_cache={},
-            prompt_embed_cache=None, cfg_scale=1.0, cfg_merge=False,
+            prompt_embed_cache=kw["prompt_embed_cache"], cfg_scale=1.0, cfg_merge=False,
         )
         if arch.uses_proprioception:
             inputs["proprio"] = kw["proprio"].to(device=arch.device, dtype=arch.dtype)
@@ -235,6 +272,7 @@ def check(runner: OfflineRunner, trace_path: str, record_path: str | None, isola
         if rebuilt["proprio"] is not None and trace["cond"].get("proprio") is not None:
             report["record_proprio_vs_trace_maxabs"] = _maxabs(rebuilt["proprio"].cpu(), trace["cond"]["proprio"])
 
+    runner.precompute_prompts([trace["cond"]["prompt"]], offload_text_encoder=False)
     inputs = runner._inputs_shared(trace)
     ref = inputs.get("first_frame_latents")
     rec_ref = trace["cond"].get("first_frame_latents")
