@@ -104,6 +104,13 @@ def _exclude_vlm_from_state_dict(state_dict: dict[str, "Tensor"]) -> dict[str, "
     return {k: v for k, v in state_dict.items() if not k.startswith(VLM_STATE_DICT_PREFIX)}
 
 
+def _probe_cpu(x):
+    """Detached CPU copy in the original dtype for probe traces (``None`` passes through)."""
+    if x is None:
+        return None
+    return x.detach().to("cpu", copy=True)
+
+
 def _assert_decode_video_supported(vb) -> None:
     """Fail-fast guard for ``generate(decode_video=True)`` against backbones
     wired to an irreversible external encoder (DINOv3 / V-JEPA2).
@@ -1385,6 +1392,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
         cfg_scale: float = 1.0,
         cfg_merge: bool = False,
         active_action_mask: Optional[Tensor] = None,
+        video_seed: Optional[int] = None,
+        action_seed: Optional[int] = None,
+        probe: Optional[dict] = None,
         **extra_pipeline_inputs: Any,
     ) -> dict:
         """Execute joint video-action denoising driven by a schedule.
@@ -1393,6 +1403,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
         (engine) should call this instead of touching video_backbone directly.
 
         Args:
+            video_seed / action_seed: Optional per-stream seeds for the initial
+                video / action noise. ``None`` falls back to ``seed``, so the
+                default path is unchanged.
+            probe: Optional research hook (G0 probe). ``None`` leaves the loop
+                untouched. Keys: ``record`` (bool) — return a per-step trace in
+                ``result["probe_trace"]``; ``replay_video_steps`` (dict mapping
+                schedule index -> video latents entering that step) together
+                with ``replay_t_v`` (dict index -> t_v) — overwrite the video
+                stream with recorded latents before every forward, keeping this
+                call's own first-frame latents.
             num_frames: Video frame count passed to the video backbone. For
                 RoboTwin this is the post-``video_stride`` count seen during
                 training, not the raw action window length.
@@ -1451,7 +1471,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             num_frames=num_frames,
             height=height,
             width=width,
-            seed=seed,
+            seed=seed if video_seed is None else video_seed,
             num_inference_steps=num_inference_steps,
             shift=shift,
             tiled=tiled,
@@ -1491,8 +1511,24 @@ class BaseWAMArchitecture(ABC, nn.Module):
             self.action_dim,
             device=device,
             dtype=dtype,
-            generator=torch.Generator(device=device).manual_seed(seed),
+            generator=torch.Generator(device=device).manual_seed(seed if action_seed is None else action_seed),
         )
+
+        probe_record = bool(probe and probe.get("record"))
+        replay_video_steps = probe.get("replay_video_steps") if probe else None
+        probe_steps = [] if probe_record else None
+        if replay_video_steps is not None:
+            if dit_cache is not None:
+                raise ValueError("probe replay requires dit_cache to be disabled")
+            if cfg_scale_f > 1.0:
+                raise ValueError("probe replay does not support CFG")
+            self._check_probe_replay(schedule, probe, inputs_shared["latents"])
+        probe_cond = None
+        if probe_record:
+            probe_cond = {
+                "first_frame_latents": _probe_cpu(inputs_shared.get("first_frame_latents")),
+                "proprio": _probe_cpu(inputs_shared.get("proprio")),
+            }
 
         # Unified-action checkpoints scatter raw actions into a larger zero-padded
         # space.  The inactive dimensions may be excluded from the training loss,
@@ -1529,6 +1565,27 @@ class BaseWAMArchitecture(ABC, nn.Module):
             v_timestep = torch.tensor([t_v], dtype=dtype, device=device)
             a_timestep = torch.tensor([t_a], dtype=dtype, device=device)
 
+            if replay_video_steps is not None:
+                replayed = replay_video_steps[i].to(device=device, dtype=inputs_shared["latents"].dtype)
+                ref_latents = inputs_shared.get("first_frame_latents")
+                if ref_latents is not None:
+                    replayed = replayed.clone()
+                    replayed[:, :, : ref_latents.shape[2]] = ref_latents
+                inputs_shared["latents"] = replayed
+            if probe_record:
+                step_record = {
+                    "i": i,
+                    "t_v": float(t_v),
+                    "t_a": float(t_a),
+                    "sigma_v": float(sigma_v),
+                    "sigma_a": float(sigma_a),
+                    "video_stepping": bool(video_stepping),
+                    "action_stepping": bool(action_stepping),
+                    "video_latents_in": _probe_cpu(inputs_shared["latents"]),
+                    "action_latents_in": _probe_cpu(action_latents),
+                    "cache_hit": False,
+                }
+
             if (
                 dit_cache is not None
                 and video_stepping
@@ -1539,6 +1596,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 # action prediction was cached together with video prediction.
                 noise_pred = dit_cache.get_cached()
                 action_noise_pred = dit_cache.get_cached_action() if action_stepping else None
+                if probe_record:
+                    step_record["cache_hit"] = True
             else:
                 if cfg_scale_f > 1.0:
                     # _forward_with_cfg runs its own cudagraph_mark_step_begin()
@@ -1561,6 +1620,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     )
                 if dit_cache is not None and video_stepping:
                     dit_cache.update(noise_pred, sigma_v, action_noise_pred)
+
+            if probe_record:
+                step_record["video_velocity"] = _probe_cpu(noise_pred)
+                step_record["action_velocity"] = _probe_cpu(action_noise_pred)
+                probe_steps.append(step_record)
 
             if video_stepping:
                 new_latents = inputs_shared["latents"] + noise_pred * (sigma_v_next - sigma_v)
@@ -1587,6 +1651,14 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 torch.cuda.synchronize()
             logger.info("[WAM_PROFILE] denoising_loop: %.3fs", time.time() - t_loop)
 
+        if replay_video_steps is not None and probe.get("replay_video_final") is not None:
+            replayed = probe["replay_video_final"].to(device=device, dtype=inputs_shared["latents"].dtype)
+            ref_latents = inputs_shared.get("first_frame_latents")
+            if ref_latents is not None:
+                replayed = replayed.clone()
+                replayed[:, :, : ref_latents.shape[2]] = ref_latents
+            inputs_shared["latents"] = replayed
+
         # VAE decode. Fail-fast when the backbone is wired to an irreversible
         # external encoder — silently returning None would mask a config
         # mismatch (caller asked for pixels but the encoder cannot produce them).
@@ -1601,7 +1673,53 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if normalizer is not None:
             actions = normalizer.unnormalize(actions)
 
-        return {"video": video_frames, "actions": actions}
+        result = {"video": video_frames, "actions": actions}
+        if probe_record:
+            result["probe_trace"] = {
+                "seeds": {
+                    "seed": int(seed),
+                    "video_seed": int(seed if video_seed is None else video_seed),
+                    "action_seed": int(seed if action_seed is None else action_seed),
+                },
+                "schedule": [(float(tv), float(ta)) for tv, ta in schedule],
+                "active_action_mask": _probe_cpu(active_action_mask),
+                "inactive_action_dims": _probe_cpu(inactive_action_dims),
+                "cond": probe_cond,
+                "steps": probe_steps,
+                "final": {
+                    "video_latents": _probe_cpu(inputs_shared["latents"]),
+                    "action_latents": _probe_cpu(action_latents),
+                    "actions_physical": np.asarray(actions).copy(),
+                },
+                "replay": replay_video_steps is not None,
+            }
+        return result
+
+    @staticmethod
+    def _check_probe_replay(schedule, probe: dict, live_latents: Tensor) -> None:
+        """Fail loudly unless a recorded video trajectory matches this call."""
+        steps = probe["replay_video_steps"]
+        t_vs = probe.get("replay_t_v")
+        if t_vs is None:
+            raise ValueError("probe replay requires replay_t_v alongside replay_video_steps")
+        executed = []
+        for i in range(len(schedule) - 1):
+            t_v, t_a = schedule[i]
+            t_v_next, t_a_next = schedule[i + 1]
+            if t_v != t_v_next or t_a != t_a_next:
+                executed.append(i)
+        missing = [i for i in executed if i not in steps]
+        if missing or set(steps) != set(executed):
+            raise ValueError(
+                f"probe replay steps {sorted(steps)} do not match this schedule's executed steps {executed}"
+            )
+        for i in executed:
+            if abs(float(t_vs[i]) - float(schedule[i][0])) > 1e-6 * max(1.0, abs(float(schedule[i][0]))):
+                raise ValueError(f"probe replay t_v mismatch at step {i}: {t_vs[i]} vs {schedule[i][0]}")
+            if tuple(steps[i].shape) != tuple(live_latents.shape):
+                raise ValueError(
+                    f"probe replay latent shape {tuple(steps[i].shape)} != live {tuple(live_latents.shape)} at step {i}"
+                )
 
     # --- §15: Classifier-Free Guidance helpers (inference-time) ---
 

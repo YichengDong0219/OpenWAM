@@ -208,11 +208,18 @@ class PolicyServer:
 
         capture_generation = obs.pop("capture_generation", False) is True
         decode_generation = obs.pop("decode_generation", capture_generation) is True
+        # G0 probe: opt-in tracing/replay. A trace is written and a receipt
+        # returned only when this request actually triggers a new generation.
+        probe = obs.pop("probe", None)
+        if probe is not None and not isinstance(probe, dict):
+            raise ValueError("probe must be an object")
         obs = self._obs_preprocessor.preprocess(obs)
-        if capture_generation:
+        if capture_generation or probe:
             obs["_decode_video"] = decode_generation
+        if probe:
+            obs["_probe"] = probe
         generation = None
-        if capture_generation:
+        if capture_generation or probe:
             action, generation = self._policy.predict_action_with_generation(obs)
         else:
             action = self._policy.predict_action(obs)
@@ -228,6 +235,8 @@ class PolicyServer:
         }
         if generation is not None:
             response["generation"] = self._serialize_generation(generation)
+            if generation.get("probe_receipt") is not None:
+                response["probe"] = generation["probe_receipt"]
         return response
 
     @staticmethod

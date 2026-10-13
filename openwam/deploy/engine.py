@@ -8,13 +8,18 @@ VACE context). The actual denoising loop lives on the model side
 (``BaseWAMArchitecture.generate``).
 """
 
+import functools
+import hashlib
 import inspect
 import logging
 import os
+import subprocess
+import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 from openwam.deploy.denoise_schedule import make_schedule, normalize_denoise_config
@@ -337,8 +342,14 @@ class JointInferenceEngine(BaseInferenceEngine):
             )
         )
 
+        probe_request = conditions.get("probe")
+        probe_kwargs = {}
+        if probe_request:
+            probe_kwargs = self._prepare_probe(probe_request, schedule)
+
         generate_kwargs = self._filter_architecture_generate_kwargs(
             {
+                **probe_kwargs,
                 "schedule": schedule,
                 "prompt": conditions.get("prompt", ""),
                 "vace_video": conditions.get("vace_video", None),
@@ -364,8 +375,188 @@ class JointInferenceEngine(BaseInferenceEngine):
         )
         result = self.architecture.generate(**generate_kwargs)
 
+        if probe_request and probe_kwargs.get("probe", {}).get("record"):
+            result["probe_receipt"] = self._write_probe_trace(
+                probe_request, probe_kwargs, result, conditions, generate_kwargs, denoise_steps
+            )
+
         # Attach optimization stats if profiling
         if self._profile and self._dit_cache is not None:
             result["dit_cache_stats"] = self._dit_cache.stats
 
         return result
+
+    # --- G0 probe (research hook; inert unless a request carries ``probe``) ---
+
+    _PROBE_KEYS = {"trace_path", "video_seed", "action_seed", "replay_trace_path", "replay_mode"}
+
+    def _probe_root(self) -> str:
+        probe_cfg = getattr(self.cfg, "probe", None)
+        root = getattr(probe_cfg, "root", None) if probe_cfg is not None else None
+        root = root or os.environ.get("OPENWAM_PROBE_ROOT")
+        if not root:
+            root = os.path.join(_repo_root(), "outputs", "probe")
+        return os.path.realpath(root)
+
+    def _prepare_probe(self, probe: dict, schedule) -> dict:
+        """Validate a probe request and translate it into architecture.generate kwargs."""
+        if not isinstance(probe, dict):
+            raise ValueError(f"probe must be a dict; got {type(probe).__name__}")
+        unknown = set(probe) - self._PROBE_KEYS
+        if unknown:
+            raise ValueError(f"unknown probe field(s): {sorted(unknown)}")
+        params = inspect.signature(self.architecture.generate).parameters
+        if "probe" not in params:
+            raise ValueError(f"{type(self.architecture).__name__}.generate does not support probe tracing/replay")
+
+        kwargs: dict = {}
+        for key in ("video_seed", "action_seed"):
+            if probe.get(key) is not None:
+                kwargs[key] = int(probe[key])
+
+        arch_probe: dict = {}
+        trace_path = probe.get("trace_path")
+        if trace_path:
+            root = self._probe_root()
+            real = os.path.realpath(trace_path)
+            if not real.startswith(root + os.sep):
+                raise ValueError(f"probe trace_path {trace_path!r} is outside probe root {root!r}")
+            if os.path.exists(real):
+                raise FileExistsError(f"probe trace_path already exists, refusing to overwrite: {real}")
+            arch_probe["record"] = True
+
+        replay_mode = probe.get("replay_mode")
+        replay_path = probe.get("replay_trace_path")
+        if (replay_mode is None) != (replay_path is None):
+            raise ValueError("probe replay_mode and replay_trace_path must be given together")
+        if replay_mode is not None:
+            if replay_mode not in ("self", "donor"):
+                raise ValueError(f"probe replay_mode must be 'self' or 'donor'; got {replay_mode!r}")
+            if self._dit_cache is not None:
+                raise ValueError("probe replay requires optimization.dit_cache.enabled=false")
+            src = torch.load(replay_path, map_location="cpu", weights_only=False)
+            steps = src.get("steps") if isinstance(src, dict) else None
+            if not steps:
+                raise ValueError(f"replay trace {replay_path!r} has no recorded steps")
+            src_schedule = src.get("meta", {}).get("schedule")
+            live_schedule = [(float(tv), float(ta)) for tv, ta in schedule]
+            if src_schedule is None or len(src_schedule) != len(live_schedule):
+                raise ValueError("replay trace schedule length does not match this request's schedule")
+            arch_probe["replay_video_steps"] = {int(s["i"]): s["video_latents_in"] for s in steps}
+            arch_probe["replay_t_v"] = {int(s["i"]): float(s["t_v"]) for s in steps}
+            arch_probe["replay_video_final"] = src.get("final", {}).get("video_latents")
+            arch_probe["_replay_source"] = {
+                "path": os.path.realpath(replay_path),
+                "sha256": _sha256_file(replay_path),
+                "mode": replay_mode,
+            }
+        if arch_probe:
+            kwargs["probe"] = arch_probe
+        return kwargs
+
+    def _write_probe_trace(self, probe_request, probe_kwargs, result, conditions, generate_kwargs, denoise_steps):
+        """Assemble the G0 trace dict, write it atomically, and return the receipt."""
+        trace = result.pop("probe_trace")
+        arch_probe = probe_kwargs["probe"]
+        steps = trace["steps"]
+        image = None
+        first = conditions.get("first_frame_image")
+        if first:
+            image = np.asarray(first[0].convert("RGB"), dtype=np.uint8).copy()
+        actions_returned = np.asarray(result["actions"]).copy()
+        binary_dims = tuple(getattr(self.architecture, "binary_command_dims", ()) or ())
+        for d in binary_dims:
+            actions_returned[..., d] = np.where(actions_returned[..., d] > 0.5, 1.0, -1.0)
+        optimization = getattr(self.cfg, "optimization", None)
+        compile_cfg = getattr(optimization, "compile", None) if optimization is not None else None
+        replay_source = arch_probe.get("_replay_source")
+        payload = {
+            "meta": {
+                "format": "openwam-g0-probe-trace/1",
+                "code": _code_version(),
+                "deploy_config_sha256": _cfg_sha256(self.cfg),
+                "checkpoint_path": getattr(self.cfg, "checkpoint_path", None),
+                "architecture": type(self.architecture).__name__,
+                **trace["seeds"],
+                "denoise_steps": int(denoise_steps),
+                "schedule": trace["schedule"],
+                "dit_cache_enabled": self._dit_cache is not None,
+                "compile_enabled": bool(getattr(compile_cfg, "enabled", False)) if compile_cfg is not None else False,
+                "num_frames": int(generate_kwargs.get("num_frames")),
+                "action_num_frames": int(generate_kwargs.get("action_num_frames")),
+                "active_action_mask": trace["active_action_mask"],
+                "inactive_action_dims": trace["inactive_action_dims"],
+                "binary_command_dims": list(binary_dims),
+                "replay_mode": replay_source["mode"] if replay_source else None,
+                "replay_source_path": replay_source["path"] if replay_source else None,
+                "replay_source_sha256": replay_source["sha256"] if replay_source else None,
+                "request": dict(probe_request),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            },
+            "cond": {
+                "prompt": generate_kwargs.get("prompt"),
+                "image": image,
+                **trace["cond"],
+            },
+            "init": {
+                "video_noise": steps[0]["video_latents_in"] if steps else None,
+                "action_noise": steps[0]["action_latents_in"] if steps else None,
+            },
+            "steps": steps,
+            "final": {**trace["final"], "actions_returned": actions_returned},
+        }
+        path = os.path.realpath(probe_request["trace_path"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            torch.save(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(path):
+            os.remove(tmp)
+            raise FileExistsError(f"probe trace_path appeared during generation, refusing to overwrite: {path}")
+        os.replace(tmp, path)
+        return {"trace_path": path, "sha256": _sha256_file(path), "n_steps": len(steps)}
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+@functools.lru_cache(maxsize=1)
+def _code_version() -> dict:
+    """Commit + dirty flag of the serving repo, resolved once per process."""
+    root = _repo_root()
+    try:
+        commit = subprocess.run(
+            ["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "-C", root, "status", "--porcelain", "--untracked-files=no"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        commit, dirty = None, None
+    return {"commit": commit, "dirty": dirty}
+
+
+def _cfg_sha256(cfg) -> Optional[str]:
+    try:
+        from omegaconf import OmegaConf
+
+        text = OmegaConf.to_yaml(cfg, resolve=True)
+    except Exception:
+        text = repr(cfg)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()

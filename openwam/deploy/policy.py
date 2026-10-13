@@ -117,4 +117,6 @@ class WAMPolicy:
             conditions["proprio"] = obs["state"]
         if "_decode_video" in obs:
             conditions["decode_video"] = bool(obs["_decode_video"])
+        if obs.get("_probe"):
+            conditions["probe"] = obs["_probe"]
         return conditions

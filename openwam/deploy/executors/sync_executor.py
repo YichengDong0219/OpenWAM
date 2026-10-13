@@ -84,6 +84,8 @@ class SyncInferenceExecutor:
             "video": result.get("video"),
             "inference_horizon": inference_horizon,
         }
+        if result.get("probe_receipt") is not None:
+            self._last_generation["probe_receipt"] = result["probe_receipt"]
 
     def reset(self):
         """Clear state between episodes."""

@@ -956,6 +956,8 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
         prompt_embed_cache: Optional[dict] = None,
         proprio: Optional[Tensor] = None,
         active_action_mask: Optional[Tensor] = None,
+        video_seed: Optional[int] = None,
+        action_seed: Optional[int] = None,
     ) -> dict:
         """Two-stage IDM generation.
 
@@ -984,7 +986,7 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
             num_frames=num_frames,
             height=height,
             width=width,
-            seed=seed,
+            seed=seed if video_seed is None else video_seed,
             num_inference_steps=num_inference_steps,
             shift=shift,
             tiled=tiled,
@@ -1019,7 +1021,7 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
             self.action_dim,
             device=device,
             dtype=dtype,
-            generator=torch.Generator(device=device).manual_seed(seed),
+            generator=torch.Generator(device=device).manual_seed(seed if action_seed is None else action_seed),
         )
 
         # Same inactive-dim pinning as BaseWAMArchitecture.generate: unsupervised
