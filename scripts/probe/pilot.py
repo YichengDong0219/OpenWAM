@@ -105,6 +105,8 @@ def main():
                ROBOTWIN_PATH=os.environ["ROBOTWIN_PATH"],
                PYTHONPATH=f"{ROOT}:{ROOT / 'benchmarks/robotwin'}:{os.environ.get('PYTHONPATH', '')}",
                PYTHONUNBUFFERED="1")
+    env.pop("ROBOTWIN_PROBE_STEP_LIMIT", None)
+    env.pop("ROBOTWIN_ENABLE_PLANNER_FALLBACK", None)
     if args.step_limit is not None:
         if args.step_limit <= 0:
             parser.error("step-limit must be positive")
