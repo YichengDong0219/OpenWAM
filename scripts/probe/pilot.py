@@ -23,6 +23,7 @@ def run_logged(command, env, path):
 
 def inventory(root):
     rows, errors = [], []
+    previous = {}
     for path in sorted(root.glob("*/ep*/chunk*/record.json")):
         d = json.loads(path.read_text())
         trace = Path(d["probe_receipt"]["trace_path"])
@@ -46,6 +47,30 @@ def inventory(root):
             errors.append(f"post observation alignment mismatch {path}: {actual} != {expected}")
         if d["termination"] == "none" and count != d["inference_horizon"]:
             errors.append(f"nonterminal short chunk {path}")
+        from benchmarks.utils.action_conversion import eef20d_to_ee16d
+        import numpy as np
+        for i, execution in enumerate(d["actions_executed"]):
+            if execution["count_delta"] != 1 or execution["offset"] != i + 1:
+                errors.append(f"noncontiguous action execution {path}:{i}")
+                continue
+            expected_action = eef20d_to_ee16d(np.asarray(d["actions"][i], dtype=np.float32))
+            if not np.allclose(execution["env_action"], expected_action, atol=1e-6, rtol=0):
+                errors.append(f"executed command differs from generation {path}:{i}")
+        key = (d["task"], d["episode"])
+        prior = previous.get(key)
+        if prior is not None:
+            if prior["termination"] != "none" or d["chunk"] != prior["chunk"] + 1:
+                errors.append(f"chunk after terminal or noncontiguous chunk id {path}")
+            if d["take_action_cnt"] != prior["take_action_cnt"] + prior["executed_count"]:
+                errors.append(f"chunk action-count boundary mismatch {path}")
+            endpoint = next((p for p in prior["post_obs"] if p["offset"] == prior["executed_count"]), None)
+            if endpoint:
+                for camera in ("head", "left", "right"):
+                    if endpoint["pngs"][camera]["sha256"] != d["pngs"][camera]["sha256"]:
+                        errors.append(f"chunk boundary camera mismatch {path}:{camera}")
+        elif d["chunk"] != 0:
+            errors.append(f"first chunk is not zero {path}")
+        previous[key] = d
         rows.append({"record": str(path), "task": d["task"], "episode": d["episode"],
                      "chunk": d["chunk"], "executed_count": count, "termination": d["termination"],
                      "trace_bytes": trace.stat().st_size if trace.exists() else None})
