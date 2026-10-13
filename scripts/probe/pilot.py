@@ -61,6 +61,7 @@ def main():
     parser.add_argument("--step-limit", type=int, help="smoke only, e.g.64 for two chunks")
     parser.add_argument("--existing-server", action="store_true")
     parser.add_argument("--inventory-only", action="store_true")
+    parser.add_argument("--verify-first", action="store_true", help="run V suite on first frozen chunk of each task")
     args = parser.parse_args()
     if args.inventory_only:
         result = inventory(args.run.resolve())
@@ -75,6 +76,7 @@ def main():
     robot_python = os.environ["ROBOTWIN_PYTHON"]
     openwam_python = os.environ["OPENWAM_PYTHON"]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="3", ROBOTWIN_PROBE_ROOT=str(run),
+               PATH=f"{Path(robot_python).parent}:{Path(robot_python).parent.parent.parent.parent / 'bin'}:/usr/local/cuda-12.4/bin:{os.environ.get('PATH', '')}",
                ROBOTWIN_PATH=os.environ["ROBOTWIN_PATH"],
                PYTHONPATH=f"{ROOT}:{ROOT / 'benchmarks/robotwin'}:{os.environ.get('PYTHONPATH', '')}",
                PYTHONUNBUFFERED="1")
@@ -101,6 +103,8 @@ def main():
         "tasks": args.tasks, "step_limit": args.step_limit,
         "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()})
+    run_logged([robot_python, "-c", "import torch; torch.zeros(1,device='cuda'); from curobo.wrap.reacher.motion_gen import MotionGen; print('CUDA/Curobo preflight passed')"],
+               env, run / "simulator_preflight.log")
     server = None
     server_stream = None
     try:
@@ -140,6 +144,13 @@ def main():
                 "--num-episodes", str(args.episodes), "--instruction-type", "unseen",
                 "--result-file", str(directory / "results.json"), "--progress-file", str(directory / "eval_progress.json")],
                 task_env, directory / "eval.log")
+            if args.verify_first:
+                first = next(iter(sorted(directory.glob("ep*/chunk*/record.json"))), None)
+                if first is None:
+                    raise RuntimeError(f"{task} produced no chunk record for verification")
+                run_logged([openwam_python, str(ROOT / "scripts/probe/verify_g0.py"), "--record", str(first),
+                    "--output-dir", str(directory / "verification"), "--url", f"ws://127.0.0.1:{args.port}"],
+                    env, directory / "verification.log")
         result = inventory(run)
         result["requested_episodes"] = len(args.tasks) * args.episodes
         result["recorded_episodes"] = len({(r["task"], r["episode"]) for r in result["chunks"]})

@@ -45,7 +45,8 @@ def task_fields(env):
                       switch_qpos=env.switch.get_qpos())
     elif task == "hanging_mug":
         fields.update(mug_functional_point=env.mug.get_functional_point(0),
-                      rack_pose=pose_dict(env.rack.get_pose()))
+                      rack_pose=pose_dict(env.rack.get_pose()),
+                      rack_functional_point=env.rack.get_functional_point(0))
     elif task == "place_empty_cup":
         fields.update(cup_pose=pose_dict(env.cup.get_pose()),
                       coaster_pose=pose_dict(env.coaster.get_pose()),
@@ -169,6 +170,7 @@ class ProbeCapture:
                        "probe": request, "probe_receipt": receipt, "server_response": response,
                        "actions": actions, "inference_horizon": horizon, "pngs": pngs,
                        "executed_count": 0, "termination": "none", "task_fields": task_fields(env),
+                       "termination_semantics": "plan_fail means take_action exception; non-Success planner statuses do not terminate baseline",
                        "post_obs": [], "observed_offsets": [], "actions_executed": [], "complete": False}
         self.chunk += 1
         self.persist()
