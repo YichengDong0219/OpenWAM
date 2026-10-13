@@ -74,7 +74,18 @@ def inventory(root):
         rows.append({"record": str(path), "task": d["task"], "episode": d["episode"],
                      "chunk": d["chunk"], "executed_count": count, "termination": d["termination"],
                      "trace_bytes": trace.stat().st_size if trace.exists() else None})
-    return {"chunks": rows, "errors": errors, "passed": bool(rows) and not errors}
+    result = {"chunks": rows, "errors": errors, "data_integrity_passed": bool(rows) and not errors}
+    config_path = root / "run.json"
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        expected = {(task, episode) for task in config["tasks"] for episode in range(config["episodes"])}
+        actual = {(r["task"], r["episode"]) for r in rows}
+        result.update(requested_episodes=len(expected), recorded_episodes=len(actual),
+                      collection_complete=actual == expected)
+    else:
+        result["collection_complete"] = bool(rows)
+    result["passed"] = result["data_integrity_passed"] and result["collection_complete"]
+    return result
 
 
 def main():
@@ -115,8 +126,9 @@ def main():
     if egl.exists():
         env.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", str(egl))
     gpu = subprocess.check_output(["nvidia-smi", "--id=3", "--query-gpu=uuid,memory.free", "--format=csv,noheader,nounits"], text=True).strip()
-    if int(gpu.rsplit(",", 1)[1]) < 26624:
-        raise RuntimeError(f"GPU3 free memory below26GiB: {gpu}")
+    minimum = 4096 if args.existing_server else 26624
+    if int(gpu.rsplit(",", 1)[1]) < minimum:
+        raise RuntimeError(f"GPU3 free memory below required {minimum}MiB: {gpu}")
     pci = subprocess.check_output(["nvidia-smi", "--id=3", "--query-gpu=pci.bus_id", "--format=csv,noheader"], text=True).strip()
     render_device = "pci:" + pci[-12:]
     config = ROOT / "configs/deploy_probe.yaml"
