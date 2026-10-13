@@ -183,6 +183,9 @@ class ModelClient:
         action_type: str = "qpos",
         debug: bool = False,
         debug_dir: str = "./debug_images",
+        probe_dir: Optional[str] = None,
+        probe_video_seed: Optional[int] = None,
+        probe_action_seed: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -222,6 +225,10 @@ class ModelClient:
         self._debug_dir = debug_dir
         self._episode = -1  # incremented to 0 on the first reset_model() call
         self._step = 0
+        self._probe_capture = None
+        if probe_dir:
+            from benchmarks.robotwin.probe_capture import ProbeCapture
+            self._probe_capture = ProbeCapture(probe_dir, video_seed=probe_video_seed, action_seed=probe_action_seed)
 
         self._ws_url = f"ws://{host}:{port}"
         self._client = WSPolicyClient(self._ws_url, timeout=request_timeout)
@@ -262,6 +269,8 @@ class ModelClient:
             # Episode boundary — create a fresh debug dir.
             self._episode += 1
             self._step = 0
+            if getattr(self, "_probe_capture", None) is not None:
+                self._probe_capture.reset(self._episode)
             if self._debug:
                 ep_dir = os.path.join(self._debug_dir, f"ep{self._episode:04d}")
                 os.makedirs(ep_dir, exist_ok=True)
@@ -361,7 +370,16 @@ class ModelClient:
             prompt=prompt,
             state=state_list,
         )
-        response = self._client.predict(payload)
+        probe = example.get("_probe")
+        if probe is not None:
+            payload["probe"] = probe
+            # Never retry an ambiguous request: that can consume a cached action twice.
+            response = self._client.predict_once(payload)
+        else:
+            response = self._client.predict(payload)
+        self._last_response = response
+        self._last_prompt = prompt
+        self._last_state = state_list
         action = np.array(response["action"], dtype=np.float32)
 
         self._step += 1
@@ -390,6 +408,9 @@ def get_model(usr_args: dict) -> ModelClient:
         action_type=usr_args.get("action_type", "qpos"),
         debug=_parse_bool(usr_args.get("debug", False), default=False),
         debug_dir=usr_args.get("debug_dir", "./debug_images"),
+        probe_dir=usr_args.get("probe_dir") or os.environ.get("ROBOTWIN_PROBE_ROOT"),
+        probe_video_seed=usr_args.get("probe_video_seed"),
+        probe_action_seed=usr_args.get("probe_action_seed"),
     )
 
 
@@ -452,7 +473,15 @@ def eval(TASK_ENV, model: ModelClient, observation: dict) -> None:
         "state": _extract_proprio(model, observation) if model._send_state else None,
     }
 
+    recorder = getattr(model, "_probe_capture", None)
+    if recorder is not None:
+        recorder.observe(TASK_ENV, observation)
+        example["_probe"] = recorder.request(TASK_ENV)
+
     action = model.step(example)
+    if recorder is not None:
+        recorder.response(TASK_ENV, observation, instruction=str(instruction), prompt=model._last_prompt,
+                          proprio=model._last_state, request=example["_probe"], response=model._last_response)
 
     # EEF mode: convert 20D (xyz+rot6d+grip)×2 → 16D (xyz+quat+grip)×2.
     if model._action_type == "ee" and len(action) == 20:
@@ -460,4 +489,21 @@ def eval(TASK_ENV, model: ModelClient, observation: dict) -> None:
 
     context = nullcontext() if _BENCHMARK_RNG_DOMAIN is None else _BENCHMARK_RNG_DOMAIN.activate()
     with context:
-        TASK_ENV.take_action(action, action_type=model._action_type)
+        if recorder is None:
+            TASK_ENV.take_action(action, action_type=model._action_type)
+        else:
+            from benchmarks.robotwin.probe_capture import observe_plans
+            events = []
+            before = TASK_ENV.take_action_cnt
+            try:
+                with observe_plans(TASK_ENV, events):
+                    TASK_ENV.take_action(action, action_type=model._action_type)
+            except Exception as exc:
+                recorder.after_action(TASK_ENV, action, before, events, exception=exc)
+                recorder.finish("plan_fail", incomplete_reason="take_action_exception")
+                raise
+            terminal = recorder.after_action(TASK_ENV, action, before, events)
+            if terminal != "none":
+                # At terminal there is no next policy action to perturb. Capture the actual final state.
+                recorder.observe(TASK_ENV, TASK_ENV.get_obs(), finish_complete=False)
+                recorder.finish(terminal)

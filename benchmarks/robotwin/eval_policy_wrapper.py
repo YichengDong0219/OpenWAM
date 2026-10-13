@@ -473,11 +473,15 @@ def _install_manifest(module) -> None:
             args["render_freq"] = 0
             domain = GlobalRngDomain.from_seed(now_seed)
             episode_info = None
+            rejection_reason = None
+            error_detail = None
             try:
                 with domain.activate():
                     task_env.setup_demo(now_ep_num=len(accepted), seed=now_seed, is_test=True, **args)
                     episode_info = task_env.play_once()
                     eligible = bool(task_env.plan_success and task_env.check_success())
+                    if not eligible:
+                        rejection_reason = "expert_plan_fail" if not task_env.plan_success else "expert_success_false"
             except Exception as exc:
                 unstable = getattr(module, "UnStableError", ())
                 if not unstable or not isinstance(exc, unstable):
@@ -486,10 +490,18 @@ def _install_manifest(module) -> None:
                         flush=True,
                     )
                 eligible = False
+                rejection_reason = "unstable" if unstable and isinstance(exc, unstable) else "expert_exception"
+                error_detail = f"{type(exc).__name__}: {exc}"
             finally:
                 with domain.activate():
                     task_env.close_env()
                 args["render_freq"] = render_freq
+            probe_root = os.environ.get("ROBOTWIN_PROBE_ROOT")
+            if probe_root:
+                from benchmarks.robotwin.probe_capture import append_seed_audit
+                append_seed_audit(probe_root, task=task_name, seed=now_seed, eligible=eligible,
+                                  reason="accepted" if eligible else rejection_reason,
+                                  episode=len(accepted) if eligible else None, error=error_detail)
             if eligible:
                 info = episode_info["info"]
                 instructions = choose_instructions(
@@ -569,6 +581,11 @@ def _install_eval(module) -> None:
                     policy_module.set_benchmark_rng_domain(domain)
                 with domain.activate():
                     task_env.setup_demo(now_ep_num=episode, seed=seed, is_test=True, **args)
+                    if os.environ.get("ROBOTWIN_PROBE_ROOT"):
+                        task_env._probe_env_seed = seed
+                        probe_step_limit = os.environ.get("ROBOTWIN_PROBE_STEP_LIMIT")
+                        if probe_step_limit:
+                            task_env.step_lim = min(task_env.step_lim, int(probe_step_limit))
                     _initialize_eval_task_state(task_name, task_env)
                     task_env.set_instruction(instruction=entry["instructions"][selected_type])
                     _canonicalize_torch_cuda(seed)
