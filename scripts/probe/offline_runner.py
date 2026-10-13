@@ -121,6 +121,39 @@ class OfflineRunner:
             inputs["proprio"] = kw["proprio"].to(device=arch.device, dtype=arch.dtype)
         return inputs
 
+    def inputs_from_record(self, record: dict) -> dict:
+        """Rebuild the server-side preprocessed observation from a client chunk record.
+
+        Uses the client's own payload builder and the server's ObsPreprocessor on the saved
+        lossless PNGs, so the comparison with the trace exercises the real online path.
+        """
+        from benchmarks.utils import client as ws_client
+
+        cams = {}
+        for label in ("head", "left", "right"):
+            entry = (record.get("pngs") or {}).get(label)
+            if entry is None:
+                cams[label] = None
+                continue
+            path = Path(entry["path"])
+            if sha256_file(path) != entry.get("sha256"):
+                raise ValueError(f"PNG sha256 mismatch for {path}")
+            cams[label] = np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+        payload = ws_client.build_payload(
+            head=ws_client.encode_numpy_b64(cams["head"]),
+            left_wrist=ws_client.encode_numpy_b64(cams["left"]) if cams["left"] is not None else None,
+            right_wrist=ws_client.encode_numpy_b64(cams["right"]) if cams["right"] is not None else None,
+            prompt=record["prompt"],
+            state=record.get("proprio"),
+        )
+        payload.pop("type", None)
+        obs = self.server._obs_preprocessor.preprocess(payload)
+        proprio = obs.get("state")
+        if proprio is not None:
+            proprio = self.arch.normalize_deploy_proprio(proprio)
+        return {"image": np.asarray(obs["image"].convert("RGB"), dtype=np.uint8), "prompt": obs.get("prompt"),
+                "proprio": proprio}
+
     # -- full chunk ----------------------------------------------------------------------------
     @torch.no_grad()
     def rerun(self, trace: dict, *, video_seed=None, action_seed=None, replay: dict | None = None,
@@ -128,9 +161,13 @@ class OfflineRunner:
         kw = self.generate_kwargs(trace, video_seed=video_seed, action_seed=action_seed)
         probe = {"record": record}
         if replay is not None:
+            rmeta = replay["meta"]
             probe["replay_video_steps"] = {int(s["i"]): s["video_latents_in"] for s in replay["steps"]}
             probe["replay_t_v"] = {int(s["i"]): float(s["t_v"]) for s in replay["steps"]}
             probe["replay_video_final"] = replay["final"]["video_latents"]
+            probe["replay_schedule"] = [tuple(x) for x in rmeta["schedule"]]
+            probe["replay_meta"] = {k: rmeta[k] for k in ("num_frames", "action_num_frames")}
+            probe["replay_active_mask"] = rmeta.get("active_action_mask")
         return self.arch.generate(**kw, probe=probe)
 
     # -- single step -----------------------------------------------------------------------------
@@ -190,6 +227,12 @@ def check(runner: OfflineRunner, trace_path: str, record_path: str | None, isola
         report["receipt_sha_match"] = receipt.get("sha256") == report["trace_sha256"]
         report["receipt_path_match"] = os.path.realpath(receipt.get("trace_path", "")) == os.path.realpath(trace_path)
         report["record_actions_vs_trace_maxabs"] = _maxabs(record["actions"], trace["final"]["actions_returned"])
+        rebuilt = runner.inputs_from_record(record)
+        report["record_image_vs_trace_maxabs"] = _maxabs(rebuilt["image"].astype(np.int16),
+                                                         np.asarray(trace["cond"]["image"]).astype(np.int16))
+        report["record_prompt_match"] = rebuilt["prompt"] == trace["cond"]["prompt"]
+        if rebuilt["proprio"] is not None and trace["cond"].get("proprio") is not None:
+            report["record_proprio_vs_trace_maxabs"] = _maxabs(rebuilt["proprio"].cpu(), trace["cond"]["proprio"])
 
     inputs = runner._inputs_shared(trace)
     ref = inputs.get("first_frame_latents")

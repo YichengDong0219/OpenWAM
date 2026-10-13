@@ -438,10 +438,16 @@ class JointInferenceEngine(BaseInferenceEngine):
             steps = src.get("steps") if isinstance(src, dict) else None
             if not steps:
                 raise ValueError(f"replay trace {replay_path!r} has no recorded steps")
-            src_schedule = src.get("meta", {}).get("schedule")
-            live_schedule = [(float(tv), float(ta)) for tv, ta in schedule]
-            if src_schedule is None or len(src_schedule) != len(live_schedule):
-                raise ValueError("replay trace schedule length does not match this request's schedule")
+            src_meta = src.get("meta", {})
+            src_schedule = src_meta.get("schedule")
+            if src_schedule is None:
+                raise ValueError(f"replay trace {replay_path!r} has no schedule in meta")
+            for key in ("num_frames", "action_num_frames", "denoise_steps"):
+                if src_meta.get(key) is None:
+                    raise ValueError(f"replay trace {replay_path!r} is missing meta.{key}")
+            arch_probe["replay_schedule"] = [tuple(x) for x in src_schedule]
+            arch_probe["replay_meta"] = {k: src_meta[k] for k in ("num_frames", "action_num_frames")}
+            arch_probe["replay_active_mask"] = src_meta.get("active_action_mask")
             arch_probe["replay_video_steps"] = {int(s["i"]): s["video_latents_in"] for s in steps}
             arch_probe["replay_t_v"] = {int(s["i"]): float(s["t_v"]) for s in steps}
             arch_probe["replay_video_final"] = src.get("final", {}).get("video_latents")
@@ -485,6 +491,7 @@ class JointInferenceEngine(BaseInferenceEngine):
                 "num_frames": int(generate_kwargs.get("num_frames")),
                 "action_num_frames": int(generate_kwargs.get("action_num_frames")),
                 "active_action_mask": trace["active_action_mask"],
+                "active_action_mask_source": trace["active_action_mask_source"],
                 "inactive_action_dims": trace["inactive_action_dims"],
                 "binary_command_dims": list(binary_dims),
                 "replay_mode": replay_source["mode"] if replay_source else None,
@@ -496,12 +503,15 @@ class JointInferenceEngine(BaseInferenceEngine):
             "cond": {
                 "prompt": generate_kwargs.get("prompt"),
                 "image": image,
+                "image_semantics": (
+                    "server-preprocessed first_frame_image passed to generate(): RGB uint8 HWC canvas "
+                    "(multiview L-shape when the checkpoint is multiview), before any VAE encoding"
+                ),
+                "image_shape": list(image.shape) if image is not None else None,
+                "image_dtype": str(image.dtype) if image is not None else None,
                 **trace["cond"],
             },
-            "init": {
-                "video_noise": steps[0]["video_latents_in"] if steps else None,
-                "action_noise": steps[0]["action_latents_in"] if steps else None,
-            },
+            "init": trace["init"],
             "steps": steps,
             "final": {**trace["final"], "actions_returned": actions_returned},
         }

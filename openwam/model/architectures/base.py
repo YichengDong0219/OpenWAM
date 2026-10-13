@@ -1495,6 +1495,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         for key, value in extra_pipeline_inputs.items():
             if value is not None:
                 inputs_shared[key] = value
+        # G0 probe: the raw initial video latents before the first-frame overwrite.
+        probe_video_noise = _probe_cpu(inputs_shared["latents"]) if (probe and probe.get("record")) else None
         ref_latents = inputs_shared.get("first_frame_latents")
         if ref_latents is not None:
             latents = inputs_shared["latents"].clone()
@@ -1523,11 +1525,21 @@ class BaseWAMArchitecture(ABC, nn.Module):
             if cfg_scale_f > 1.0:
                 raise ValueError("probe replay does not support CFG")
             self._check_probe_replay(schedule, probe, inputs_shared["latents"])
-        probe_cond = None
+            replay_meta = probe.get("replay_meta") or {}
+            for key, live in (("num_frames", num_frames), ("action_num_frames", action_num_frames)):
+                if key not in replay_meta or int(replay_meta[key]) != int(live):
+                    raise ValueError(f"probe replay {key} {replay_meta.get(key)} != live {live}")
+        probe_cond = probe_init = None
         if probe_record:
             probe_cond = {
                 "first_frame_latents": _probe_cpu(inputs_shared.get("first_frame_latents")),
                 "proprio": _probe_cpu(inputs_shared.get("proprio")),
+            }
+            probe_init = {
+                "video_noise": probe_video_noise,
+                "video_noise_source": "input_video_latents" if input_video_latents is not None else "seeded_noise",
+                "video_latents_effective": _probe_cpu(inputs_shared["latents"]),
+                "action_noise": _probe_cpu(action_latents),
             }
 
         # Unified-action checkpoints scatter raw actions into a larger zero-padded
@@ -1537,6 +1549,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # into the next denoising step.
         inactive_action_noise = None
         inactive_action_dims = self._resolve_inactive_action_dims(active_action_mask, device)
+        if replay_video_steps is not None and probe.get("replay_active_mask") is not None:
+            live_inactive = (
+                inactive_action_dims.detach().cpu()
+                if inactive_action_dims is not None
+                else torch.zeros(self.action_dim, dtype=torch.bool)
+            )
+            src_active = torch.as_tensor(probe["replay_active_mask"], dtype=torch.bool).cpu()
+            if src_active.shape != live_inactive.shape or not torch.equal(src_active, ~live_inactive):
+                raise ValueError("probe replay source active_action_mask differs from this call's active mask")
 
         num_train_ts_v = float(self.video_scheduler.num_train_timesteps)
         num_train_ts_a = float(self.action_scheduler.num_train_timesteps)
@@ -1669,12 +1690,22 @@ class BaseWAMArchitecture(ABC, nn.Module):
             video_frames = None
 
         actions = action_latents.squeeze(0).float().cpu().numpy()
+        actions_normalized = actions.copy()
         normalizer = getattr(self, "normalizer", None)
         if normalizer is not None:
             actions = normalizer.unnormalize(actions)
 
         result = {"video": video_frames, "actions": actions}
         if probe_record:
+            if active_action_mask is not None:
+                resolved_mask = torch.as_tensor(active_action_mask, dtype=torch.bool).detach().cpu()
+                mask_source = "argument"
+            elif inactive_action_dims is not None:
+                resolved_mask = (~inactive_action_dims).detach().cpu()
+                mask_source = "inferred_from_normalizer"
+            else:
+                resolved_mask = torch.ones(self.action_dim, dtype=torch.bool)
+                mask_source = "all_active"
             result["probe_trace"] = {
                 "seeds": {
                     "seed": int(seed),
@@ -1682,13 +1713,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     "action_seed": int(seed if action_seed is None else action_seed),
                 },
                 "schedule": [(float(tv), float(ta)) for tv, ta in schedule],
-                "active_action_mask": _probe_cpu(active_action_mask),
+                "active_action_mask": resolved_mask,
+                "active_action_mask_source": mask_source,
                 "inactive_action_dims": _probe_cpu(inactive_action_dims),
                 "cond": probe_cond,
+                "init": probe_init,
                 "steps": probe_steps,
                 "final": {
                     "video_latents": _probe_cpu(inputs_shared["latents"]),
                     "action_latents": _probe_cpu(action_latents),
+                    "actions_normalized": actions_normalized,
                     "actions_physical": np.asarray(actions).copy(),
                 },
                 "replay": replay_video_steps is not None,
@@ -1702,6 +1736,15 @@ class BaseWAMArchitecture(ABC, nn.Module):
         t_vs = probe.get("replay_t_v")
         if t_vs is None:
             raise ValueError("probe replay requires replay_t_v alongside replay_video_steps")
+        src_schedule = probe.get("replay_schedule")
+        if src_schedule is None:
+            raise ValueError("probe replay requires the source trace's full schedule (replay_schedule)")
+        if len(src_schedule) != len(schedule):
+            raise ValueError(f"probe replay schedule length {len(src_schedule)} != live {len(schedule)}")
+        for k, ((sv, sa), (lv, la)) in enumerate(zip(src_schedule, schedule)):
+            for name, s_val, l_val in (("t_v", sv, lv), ("t_a", sa, la)):
+                if abs(float(s_val) - float(l_val)) > 1e-6 * max(1.0, abs(float(l_val))):
+                    raise ValueError(f"probe replay schedule {name} mismatch at entry {k}: {s_val} vs {l_val}")
         executed = []
         for i in range(len(schedule) - 1):
             t_v, t_a = schedule[i]
