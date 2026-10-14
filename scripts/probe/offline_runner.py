@@ -159,6 +159,58 @@ class OfflineRunner:
             inputs["proprio"] = kw["proprio"].to(device=arch.device, dtype=arch.dtype)
         return inputs
 
+    def canvas_from_pngs(self, pngs: dict, prompt: str = "", state=None):
+        """Server-side canvas (PIL) for one set of client PNGs, via the real ObsPreprocessor."""
+        from benchmarks.utils import client as ws_client
+
+        cams = {}
+        for label in ("head", "left", "right"):
+            entry = (pngs or {}).get(label)
+            if entry is None:
+                cams[label] = None
+                continue
+            path = Path(entry["path"])
+            if sha256_file(path) != entry.get("sha256"):
+                raise ValueError(f"PNG sha256 mismatch for {path}")
+            cams[label] = np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+        payload = ws_client.build_payload(
+            head=ws_client.encode_numpy_b64(cams["head"]),
+            left_wrist=ws_client.encode_numpy_b64(cams["left"]) if cams["left"] is not None else None,
+            right_wrist=ws_client.encode_numpy_b64(cams["right"]) if cams["right"] is not None else None,
+            prompt=prompt, state=state,
+        )
+        payload.pop("type", None)
+        return self.server._obs_preprocessor.preprocess(payload)
+
+    def gt_future_frames(self, record: dict, horizon: int = 32, stride: int = 4) -> list:
+        """The executed future as 1 + horizon/stride canvases (request frame + post_obs offsets).
+
+        Only for chunks that executed the whole horizon with every aligned observation present;
+        otherwise raises (a truncated chunk has no real future to stand in for the prediction).
+        """
+        if int(record.get("executed_count", -1)) != horizon or record.get("termination") not in (None, "none"):
+            raise ValueError(f"chunk did not execute the full {horizon}-step horizon without terminating")
+        by_offset = {int(p["offset"]): p for p in record.get("post_obs", [])}
+        offsets = list(range(stride, horizon + 1, stride))
+        missing = [o for o in offsets if o not in by_offset]
+        if missing:
+            raise ValueError(f"missing post_obs offsets {missing}")
+        # the preprocessor insists on a state for proprio checkpoints; it does not touch the canvas
+        state = record.get("proprio")
+        frames = [self.canvas_from_pngs(record["pngs"], state=state)["image"]]
+        frames += [self.canvas_from_pngs(by_offset[o]["pngs"], state=state)["image"] for o in offsets]
+        return frames
+
+    @torch.no_grad()
+    def encode_frames(self, frames: list):
+        """Encode canvases exactly as training does (preprocess_video + VAE encode_video)."""
+        from openwam.model.video_backbone.wan import encode as wan_encode
+
+        vb, arch = self.arch.video_backbone, self.arch
+        x = wan_encode.preprocess_video(frames, encoder=vb.video_encoder, dtype=arch.dtype, device=arch.device)
+        lat = wan_encode.encode_video(x, vae=vb.vae, encoder=vb.video_encoder)
+        return lat.to(dtype=arch.dtype, device=arch.device)
+
     def inputs_from_record(self, record: dict) -> dict:
         """Rebuild the server-side preprocessed observation from a client chunk record.
 
@@ -195,9 +247,13 @@ class OfflineRunner:
     # -- full chunk ----------------------------------------------------------------------------
     @torch.no_grad()
     def rerun(self, trace: dict, *, video_seed=None, action_seed=None, replay: dict | None = None,
-              record: bool = True) -> dict:
+              record: bool = True, cond_future_override=None) -> dict:
+        """Full generation from a trace's conditions. ``cond_future_override`` (IDM only) replaces the
+        future frames of the clean stage-2 condition; ``replay`` (joint models) replays a video trajectory."""
         kw = self.generate_kwargs(trace, video_seed=video_seed, action_seed=action_seed)
         probe = {"record": record}
+        if cond_future_override is not None:
+            probe["cond_future_override"] = cond_future_override
         if replay is not None:
             rmeta = replay["meta"]
             probe["replay_video_steps"] = {int(s["i"]): s["video_latents_in"] for s in replay["steps"]}

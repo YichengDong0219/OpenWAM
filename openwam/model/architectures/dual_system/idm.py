@@ -24,13 +24,14 @@ import logging
 import types
 from typing import Callable, Optional, Tuple
 
+import numpy as np
 import torch
 from einops import rearrange
 from torch import Tensor
 
 from openwam.model.action_backbone.components import rope_apply_1d
 from openwam.model.action_backbone.separate_action_dit import ActionDiT
-from openwam.model.architectures.base import BaseWAMArchitecture
+from openwam.model.architectures.base import BaseWAMArchitecture, _probe_cpu
 from openwam.model.architectures.dual_system.mot_driver import DualSystemMoTDriver
 from openwam.model.architectures.registry import register_architecture
 from openwam.model.architectures.utils.common import resolve_bridge_layers
@@ -958,8 +959,15 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
         active_action_mask: Optional[Tensor] = None,
         video_seed: Optional[int] = None,
         action_seed: Optional[int] = None,
+        probe: Optional[dict] = None,
     ) -> dict:
         """Two-stage IDM generation.
+
+        ``probe`` (G2 research hook, inert when ``None``): ``record`` returns a trace in
+        ``result["probe_trace"]`` (stage-1 video steps, stage-2 action steps, the stage-1 future and
+        the clean condition actually used); ``cond_future_override`` (a latent tensor shaped like the
+        video latents) replaces the FUTURE frames of the clean stage-2 condition after stage 1, keeping
+        this call's own first-frame latents. Shape and dtype must match exactly.
 
         Stage 1: Denoise video independently using the video DiT (no action).
         Stage 2: Freeze denoised video latents, denoise action with standard
@@ -1029,6 +1037,18 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
         inactive_action_noise = None
         inactive_action_dims = self._resolve_inactive_action_dims(active_action_mask, device)
 
+        probe_record = bool(probe and probe.get("record"))
+        probe_override = probe.get("cond_future_override") if probe else None
+        if probe and (dit_cache is not None):
+            raise ValueError("IDM probe requires dit_cache to be disabled")
+        stage1_steps, stage2_steps = ([], []) if probe_record else (None, None)
+        probe_init = None
+        if probe_record:
+            probe_init = {
+                "video_latents_effective": _probe_cpu(inputs_shared_with_proprio["latents"]),
+                "action_noise": _probe_cpu(action_latents),
+            }
+
         num_train_ts_v = float(self.video_scheduler.num_train_timesteps)
         num_train_ts_a = float(self.action_scheduler.num_train_timesteps)
 
@@ -1069,12 +1089,30 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
                 if dit_cache is not None:
                     dit_cache.update(noise_pred, sigma_v)
 
+            if probe_record:
+                stage1_steps.append({"i": i, "t_v": float(t_v), "sigma_v": float(sigma_v),
+                                     "video_latents_in": _probe_cpu(inputs_shared_with_proprio["latents"]),
+                                     "video_velocity": _probe_cpu(noise_pred)})
             new_latents = inputs_shared_with_proprio["latents"] + noise_pred * (sigma_v_next - sigma_v)
             ref_latents = inputs_shared_with_proprio.get("first_frame_latents")
             if ref_latents is not None:
                 new_latents = new_latents.clone()
                 new_latents[:, :, : ref_latents.shape[2]] = ref_latents
             inputs_shared_with_proprio["latents"] = new_latents
+
+        stage1_future = _probe_cpu(inputs_shared_with_proprio["latents"]) if probe_record else None
+        if probe_override is not None:
+            live = inputs_shared_with_proprio["latents"]
+            if tuple(probe_override.shape) != tuple(live.shape) or probe_override.dtype != live.dtype:
+                raise ValueError(
+                    f"cond_future_override {tuple(probe_override.shape)}/{probe_override.dtype} incompatible with "
+                    f"live video latents {tuple(live.shape)}/{live.dtype}"
+                )
+            replaced = probe_override.to(device=live.device).clone()
+            ref_latents = inputs_shared_with_proprio.get("first_frame_latents")
+            if ref_latents is not None:
+                replaced[:, :, : ref_latents.shape[2]] = ref_latents
+            inputs_shared_with_proprio["latents"] = replaced
 
         if profile:
             if torch.cuda.is_available():
@@ -1215,6 +1253,10 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
                 )
                 action_noise_pred = ab.extract_prediction(astate)
 
+            if probe_record:
+                stage2_steps.append({"i": i, "t_a": float(t_a), "sigma_a": float(sigma_a),
+                                     "action_latents_in": _probe_cpu(action_latents),
+                                     "action_velocity": _probe_cpu(action_noise_pred)})
             if action_noise_pred is not None:
                 if inactive_action_dims is not None and inactive_action_noise is None:
                     sigma_a_f = float(sigma_a)
@@ -1238,11 +1280,42 @@ class DualSystemIDMArchitecture(BaseWAMArchitecture):
         else:
             video_frames = None
         actions_out = action_latents.squeeze(0).float().cpu().numpy()
+        actions_normalized = actions_out.copy()
         normalizer = getattr(self, "normalizer", None)
         if normalizer is not None:
             actions_out = normalizer.unnormalize(actions_out)
 
-        return {"video": video_frames, "actions": actions_out}
+        result = {"video": video_frames, "actions": actions_out}
+        if probe_record:
+            if active_action_mask is not None:
+                resolved_mask, mask_source = torch.as_tensor(active_action_mask, dtype=torch.bool).cpu(), "argument"
+            elif inactive_action_dims is not None:
+                resolved_mask, mask_source = (~inactive_action_dims).detach().cpu(), "inferred_from_normalizer"
+            else:
+                resolved_mask, mask_source = torch.ones(self.action_dim, dtype=torch.bool), "all_active"
+            result["probe_trace"] = {
+                "architecture_variant": "idm",
+                "seeds": {"seed": int(seed),
+                          "video_seed": int(seed if video_seed is None else video_seed),
+                          "action_seed": int(seed if action_seed is None else action_seed)},
+                "schedule": [(float(tv), float(ta)) for tv, ta in schedule],
+                "active_action_mask": resolved_mask,
+                "active_action_mask_source": mask_source,
+                "inactive_action_dims": _probe_cpu(inactive_action_dims),
+                "cond": {"first_frame_latents": _probe_cpu(inputs_shared_with_proprio.get("first_frame_latents")),
+                         "proprio": _probe_cpu(proprio_arg)},
+                "init": probe_init,
+                "stage1_steps": stage1_steps,
+                "steps": stage2_steps,
+                "final": {"stage1_future_latents": stage1_future,
+                          "cond_video_latents_used": _probe_cpu(inputs_shared_with_proprio["latents"]),
+                          "cond_future_overridden": probe_override is not None,
+                          "video_latents": _probe_cpu(inputs_shared_with_proprio["latents"]),
+                          "action_latents": _probe_cpu(action_latents),
+                          "actions_normalized": actions_normalized,
+                          "actions_physical": np.asarray(actions_out).copy()},
+            }
+        return result
 
 
 __all__ = ["DualSystemIDMArchitecture"]
