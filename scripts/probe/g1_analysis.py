@@ -161,7 +161,7 @@ def analyze(prereg,run,split):
                     if selected:stages[label+'/'+stage]=summarize([o for o,v in selected],[v for o,v in selected],reg['statistics']['bootstrap_seed'],reg['statistics']['bootstrap_repetitions'])
         bytask[task]=dict(Q1=tss,Q2=bands,Q2_by_relative_stage=stages)
     return dict(format='openwam-g1-analysis/1',split=split,prereg_sha256=digest,complete=True,
-        input_hashes={n:sha(run/n) for n in ('index.jsonl','step_response.jsonl','isolated_check.jsonl','decode_proxy.jsonl')},
+        input_hashes={n:sha(run/n) if (run/n).exists() else None for n in ('index.jsonl','step_response.jsonl','isolated_check.jsonl','decode_proxy.jsonl')},
         grid_sha256_manifest=source_hashes,runtime_versions=sorted(code_versions),runtime_config_sha256=sorted(configs),
         audit=dict(grid_files=len(index),step_rows=len(steps),decoded_clips=len(proxies),frames=frame_count,
                    no_op_max_abs=max(r['noop_vs_recorded']['max_abs'] for r in steps),
