@@ -72,11 +72,14 @@ def append_jsonl(path: Path, row: dict) -> None:
 
 
 class Run:
-    def __init__(self, prereg_path: Path, out: Path, ckpt_dir: str, config: str | None, split: str | None = None):
+    def __init__(self, prereg_path: Path, out: Path, ckpt_dir: str, config: str | None, split: str,
+                 freeze_receipt: Path | None = None, explore_freeze: Path | None = None):
         self.split = split
         self.prereg_path = prereg_path.resolve()
         self.prereg = json.loads(self.prereg_path.read_text())
         self.prereg_sha = sha256_file(self.prereg_path)
+        self.formal = self.prereg.get("format") == "openwam-g1-prereg/1"
+        self.receipts = self._check_receipts(freeze_receipt, explore_freeze)
         self.out = out.resolve()
         root = (REPO / "outputs" / "probe").resolve()
         if not str(self.out).startswith(str(root) + os.sep):
@@ -92,19 +95,66 @@ class Run:
             for line in self.index.read_text().splitlines():
                 row = json.loads(line)
                 self.done[row["path"]] = row["sha256"]
+        for obs in self.observations():
+            if obs.get("record_sha256") and sha256_file(obs["record"]) != obs["record_sha256"]:
+                raise SystemExit(f"record sha mismatch for {obs['obs_id']}")
         self.runner = OfflineRunner(ckpt_dir, config)
+        from openwam.deploy.engine import _cfg_sha256, _code_version
+
+        self.runtime_code = dict(_code_version())
+        self.runtime_config_sha256 = _cfg_sha256(self.runner.engine.cfg)
+        self.checkpoint_path = str(Path(ckpt_dir).resolve())
+        if self.formal and (self.runtime_code.get("dirty") or not self.runtime_code.get("commit")):
+            raise SystemExit(f"formal G1 runs require a clean, committed tree; got {self.runtime_code}")
         self._sources = {}
         prompts = [self.source(o)["cond"]["prompt"] for o in self.observations()]
         info = self.runner.precompute_prompts(prompts, offload_text_encoder=True)
         print(f"[init] prompts {info}", flush=True)
 
+    # -- protections (CODEX_R10) ---------------------------------------------------------------
+    def _check_receipts(self, freeze_receipt, explore_freeze) -> dict:
+        """Formal preregs need a separate joint-freeze receipt naming this file's sha256; the holdout
+        split additionally needs an exploration-analysis freeze receipt naming the same prereg."""
+        out = {}
+        if not self.formal:
+            if self.split not in ("smoke",):
+                raise SystemExit("non-formal (smoke) preregs may only be run with --split smoke")
+            return out
+        if self.split not in ("explore", "holdout"):
+            raise SystemExit("formal G1 prereg: --split must be explore or holdout")
+        if freeze_receipt is None:
+            raise SystemExit("formal G1 prereg requires --freeze-receipt")
+        rec = json.loads(Path(freeze_receipt).read_text())
+        if rec.get("prereg_sha256") != self.prereg_sha or rec.get("status") != "frozen":
+            raise SystemExit("freeze receipt does not freeze this prereg sha256")
+        out["freeze_receipt"] = {"path": str(Path(freeze_receipt).resolve()), "sha256": sha256_file(freeze_receipt)}
+        if self.split == "holdout":
+            if explore_freeze is None:
+                raise SystemExit("holdout requires --explore-freeze (exploration analysis freeze receipt)")
+            ex = json.loads(Path(explore_freeze).read_text())
+            if ex.get("prereg_sha256") != self.prereg_sha or ex.get("explore_analysis_frozen") is not True:
+                raise SystemExit("explore freeze receipt does not cover this prereg")
+            out["explore_freeze"] = {"path": str(Path(explore_freeze).resolve()), "sha256": sha256_file(explore_freeze)}
+        return out
+
+    def load_grid(self, obs: dict, v: int, a: int) -> dict:
+        """Load a grid generation only after checking index sha, file sha, prereg, source and seeds."""
+        path = self.grid_path(obs, v, a)
+        want = self.done.get(str(path))
+        if want is None or not path.exists() or sha256_file(path) != want:
+            raise RuntimeError(f"grid output missing or not matching index: {path}")
+        tr = torch.load(path, map_location="cpu", weights_only=False)
+        m = tr["meta"]
+        if (m.get("prereg_sha256") != self.prereg_sha or m.get("source_trace_sha256") != obs["trace_sha256"]
+                or int(m.get("video_seed")) != int(v) or int(m.get("action_seed")) != int(a)):
+            raise RuntimeError(f"grid output identity mismatch: {path}")
+        return tr
+
     # -- helpers -----------------------------------------------------------------------------
     def observations(self):
-        obs = self.prereg["observations"]
-        if self.split is not None:
-            obs = [o for o in obs if o.get("split") == self.split]
-            if not obs:
-                raise SystemExit(f"no observations with split={self.split!r}")
+        obs = [o for o in self.prereg["observations"] if o.get("split") == self.split]
+        if not obs:
+            raise SystemExit(f"no observations with split={self.split!r}")
         return obs
 
     def source(self, obs: dict) -> dict:
@@ -141,7 +191,11 @@ class Run:
             "seed": src["meta"]["seed"],
             "video_seed": int(video_seed),
             "action_seed": int(action_seed),
-            "code": src["meta"]["code"],
+            "source_code": src["meta"]["code"],
+            "runtime_code": self.runtime_code,
+            "runtime_config_sha256": self.runtime_config_sha256,
+            "checkpoint_path": self.checkpoint_path,
+            "receipts": self.receipts,
             "prereg_sha256": self.prereg_sha,
             **(extra_meta or {}),
         }
@@ -179,8 +233,8 @@ class Run:
                 path = self.obs_dir(obs) / "swap" / f"r{vr}-{ar}_d{vd}-{ad}.pt"
                 if self.reuse(path):
                     continue
-                donor = torch.load(self.grid_path(obs, vd, ad), map_location="cpu", weights_only=False)
-                receiver = torch.load(self.grid_path(obs, vr, ar), map_location="cpu", weights_only=False)
+                donor = self.load_grid(obs, vd, ad)
+                receiver = self.load_grid(obs, vr, ar)
                 res = self.runner.rerun(src, video_seed=vr, action_seed=ar, replay=donor, record=True)
                 tr = self.as_trace(src, res, video_seed=vr, action_seed=ar,
                                    extra_meta={"replay_donor": [vd, ad], "role": role})
@@ -211,7 +265,7 @@ class Run:
 
             def grid_trace(v, a):
                 if (v, a) not in cache_traces:
-                    cache_traces[(v, a)] = torch.load(self.grid_path(obs, v, a), map_location="cpu", weights_only=False)
+                    cache_traces[(v, a)] = self.load_grid(obs, v, a)
                 return cache_traces[(v, a)]
 
             for pair in self.prereg["pairs"]:
@@ -253,8 +307,8 @@ class Run:
             inputs = self.runner._inputs_shared(src)
             vr, ar = self.prereg["video_seeds"][0], self.prereg["action_seeds"][0]
             vd = self.prereg["video_seeds"][1]
-            rec = torch.load(self.grid_path(obs, vr, ar), map_location="cpu", weights_only=False)
-            don = torch.load(self.grid_path(obs, vd, ar), map_location="cpu", weights_only=False)
+            rec = self.load_grid(obs, vr, ar)
+            don = self.load_grid(obs, vd, ar)
             mask = rec["meta"]["active_action_mask"]
             for band, i in obs["sigma_steps"].items():
                 s_don = next(s for s in don["steps"] if int(s["i"]) == int(i))
@@ -283,7 +337,7 @@ class Run:
                     d = self.obs_dir(obs) / "decoded" / f"v{v}_a{a}"
                     if (d / "DONE").exists():
                         continue
-                    tr = torch.load(self.grid_path(obs, v, a), map_location="cpu", weights_only=False)
+                    tr = self.load_grid(obs, v, a)
                     lat = tr["final"]["video_latents"].to(self.runner.arch.device)
                     frames = vb.decode_video(lat, tiled=True)
                     d.mkdir(parents=True, exist_ok=True)
@@ -314,13 +368,17 @@ class _null:
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("cmd", choices=["grid", "step", "isolated", "decode", "all", "swap"])
-    p.add_argument("--split", default=None, help="restrict to observations of this split (e.g. explore)")
+    p.add_argument("--split", required=True, choices=["explore", "holdout", "smoke"],
+                   help="observations of this split only; formal preregs allow explore|holdout")
+    p.add_argument("--freeze-receipt", type=Path, default=None, help="joint freeze receipt (formal prereg)")
+    p.add_argument("--explore-freeze", type=Path, default=None, help="exploration-analysis freeze (holdout only)")
     p.add_argument("--prereg", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--ckpt-dir", default=str(REPO / "assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-RoboTwin-Full"))
     p.add_argument("--config", default=None)
     args = p.parse_args(argv)
-    run = Run(args.prereg, args.out, args.ckpt_dir, args.config, split=args.split)
+    run = Run(args.prereg, args.out, args.ckpt_dir, args.config, split=args.split,
+              freeze_receipt=args.freeze_receipt, explore_freeze=args.explore_freeze)
     for cmd in (["grid", "step", "isolated", "decode"] if args.cmd == "all" else [args.cmd]):
         getattr(run, cmd)()
 
