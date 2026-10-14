@@ -46,6 +46,7 @@ def main():
             q.ledger=C.Ledger(q.ledger.out,stamp);call();assert q.runner.calls==before;passed.append(kind+' valid resume checks identity without new generation')
             row=q.ledger.rows['identity|o|1001-2001'];original=torch.load(row['path'],weights_only=False)
             def forge(obj):
+                row=q.ledger.rows['identity|o|1001-2001']
                 torch.save(obj,row['path']);row['sha256']=C.sha256_file(row['path']);q.ledger.index.write_text(''.join(json.dumps(r)+'\n' for r in q.ledger.rows.values()));q.ledger=C.Ledger(q.ledger.out,stamp)
             bad=copy.deepcopy(original);bad['final']['actions_physical']=act+1;forge(bad);assert rejected(call);passed.append(kind+' correct SHA but corrupt identity tensors rejected')
             bad=copy.deepcopy(original);bad['meta']['obs_id']='foreign';forge(bad);assert rejected(call);passed.append(kind+' correct SHA but wrong observation rejected')
