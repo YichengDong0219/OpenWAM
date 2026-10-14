@@ -100,9 +100,13 @@ def main():
   for k,v in expected.items():assert m[k]==v,(s,o['obs_id'],kind,k)
   if kind!='gt_future':
    rt=bindings[s]['runtime_description'];assert [[float(x),float(y)] for x,y in m['schedule']]==rt['schedule'];assert m['runtime_engine_config_sha256']==rt['engine_config_sha256'];assert m['runtime_code']['commit'].startswith('f01665b') and not m['runtime_code']['dirty'];assert m['receipts']['freeze_receipt']['sha256']==FREEZE_SHA
-   assert tr['init']['action_noise'].shape[1]==32;assert len(tr['steps'])==10;assert [t['i'] for t in tr['steps']]==list(range(10));assert eq(tr['final']['actions_returned'],tr['final']['actions_physical']);actions=tr['final']['actions_physical'];assert np.shape(actions)==(32,20) and np.isfinite(actions).all()
+   assert tr['init']['action_noise'].shape[1]==32;
+   for st in tr['steps']:
+    for value in st.values():
+     if torch.is_tensor(value):assert torch.isfinite(value).all()
+   assert len(tr['steps'])==10;assert [t['i'] for t in tr['steps']]==list(range(10));assert eq(tr['final']['actions_returned'],tr['final']['actions_physical']);actions=tr['final']['actions_physical'];assert np.shape(actions)==(32,20) and np.isfinite(actions).all()
   return tr
- def row(group,o,key,m):return {'group':group,'obs_id':o['obs_id'],'task':o['task'],'episode':o['episode'],'stage':o.get('stage'),'key':key,'metrics':m}
+ def row(group,o,key,m):return {'group':group,'obs_id':o['obs_id'],'task':o['task'],'episode':o['episode'],'stage':o.get('relative_stage'),'key':key,'metrics':m}
  rows=[];engineering=collections.Counter();coverage=[]
  for o in observations:
   cache.clear();oid=o['obs_id'];assert sha(o['record'])==o['record_sha256'] and sha(o['trace'])==o['trace_sha256'];rec=json.loads(Path(o['record']).read_text());source=torch.load(o['trace'],map_location='cpu',weights_only=False);qsrc=get('Q6','source|'+oid)
@@ -125,7 +129,7 @@ def main():
      for st,dt in zip(tr['steps'],bd['steps']):assert eq(st['video_latents_in'][:,:,1:],dt['video_latents_in'][:,:,1:]) and eq(st['video_latents_in'][:,:,:1],source['cond']['first_frame_latents'])
     else:
      ff=qsrc['cond']['first_frame_latents'];assert eq(tr['final']['stage1_future_latents'],br['final']['stage1_future_latents']);assert eq(tr['final']['cond_video_latents_used'][:,:,1:],bd['final']['stage1_future_latents'][:,:,1:]);assert eq(tr['final']['cond_video_latents_used'][:,:,:1],ff)
-    engineering[s+'_intervention_controls']+=1;rows.append(row(s+'_effect',o,key,physical(outa,receiver)));rows.append(row(s+'_natural',o,key,physical(donor,receiver)));dire=direction(outa,receiver,donor);rows.append(row(s+'_direction_coverage',o,key,{'eligible_fraction':float(dire['eligible'])}))
+    engineering[s+'_intervention_controls']+=1;engineering[s+'_posthoc_donor_final_all20_bitexact']+=int(eq(tr['final']['actions_physical'],bd['final']['actions_physical']));engineering[s+'_posthoc_donor_action_steps_bitexact']+=int(step_eq(tr['steps'],bd['steps'],('t_a','action_latents_in','action_velocity')));rows.append(row(s+'_effect',o,key,physical(outa,receiver)));rows.append(row(s+'_natural',o,key,physical(donor,receiver)));dire=direction(outa,receiver,donor);rows.append(row(s+'_direction_coverage',o,key,{'eligible_fraction':float(dire['eligible'])}))
     if dire.pop('eligible'):rows.append(row(s+'_direction',o,key,dire))
   for p in pre['idm_action_scatter_pairs']:
    v=p['video_seed'];a,b=p['action_seed_pair'];rows.append(row('Q6_action_scatter',o,f'{v}-{a}-{b}',physical(a2[v,a]['final']['actions_physical'],a2[v,b]['final']['actions_physical'])))
@@ -138,7 +142,7 @@ def main():
     key=f'gt|{oid}|{v}-{a}';tr=check('Q6',get('Q6',key),o,'gt',dict(record_sha256=o['record_sha256'],video_seed=v,action_seed=a,donor='gt',source=ref('Q6','source|'+oid),receiver_baseline=r2[v,a],gt_future=ref('Q6','gt_future|'+oid)))
     br=a2[v,a];assert eq(tr['final']['stage1_future_latents'],br['final']['stage1_future_latents']);assert eq(tr['final']['cond_video_latents_used'][:,:,1:],g['latents'][:,:,1:]);assert eq(tr['final']['cond_video_latents_used'][:,:,:1],qsrc['cond']['first_frame_latents']);assert eq(tr['init']['action_noise'],br['init']['action_noise'])
     ga,ba=tr['final']['actions_physical'],br['final']['actions_physical'];mg,ms=physical(ga,rec['actions']),physical(ba,rec['actions']);m=physical(ga,ba);m.update(E_gt_m=mg['D_xyz_m'],E_self_m=ms['D_xyz_m'],delta_E_m=mg['D_xyz_m']-ms['D_xyz_m']);rows.append(row('GT_command_consistency',o,key,m));engineering['GT_intervention_controls']+=1
-  coverage.append({'obs_id':oid,'task':o['task'],'episode':o['episode'],'eligible_GT':oid in gtids,'executed_count':rec['executed_count'],'planner_failures':sum(bool(e.get('planner_failed')) for e in rec['actions_executed'])})
+  coverage.append({'obs_id':oid,'task':o['task'],'episode':o['episode'],'eligible_GT':oid in gtids,'executed_count':rec['executed_count'],'planner_failures':sum(p.get('status')!='Success' for e in rec['actions_executed'] for p in e.get('planner',[]))})
   print(oid,'audit and metrics complete',flush=True)
  counts=collections.Counter(r['group'] for r in rows);assert counts['Q5_effect']==counts['Q5_natural']==counts['Q6_effect']==counts['Q6_natural']==1440;assert counts['Q6_action_scatter']==720 and counts['GT_command_consistency']==416
  write(out/'audit.json',{'status':'passed','audits':audits,'engineering_counts':dict(engineering),'source_record_coverage':coverage,'own_script_sha256':sha(__file__),'prereg_sha256':PRE_SHA,'no_missing_expected_rows':True})
