@@ -78,9 +78,13 @@ def resolve_config(config: str, ckpt_dir: str):
 
 
 def cfg_text(cfg) -> str:
+    """Resolved YAML; unresolved YAML when an interpolation cannot be resolved (e.g. ``${now:...}``)."""
     from omegaconf import OmegaConf
 
-    return OmegaConf.to_yaml(cfg, resolve=True)
+    try:
+        return OmegaConf.to_yaml(cfg, resolve=True)
+    except Exception:
+        return OmegaConf.to_yaml(cfg, resolve=False)
 
 
 def cfg_sha(cfg) -> str:
@@ -168,7 +172,10 @@ def describe_runtime(runner) -> dict:
     eng, arch = runner.engine, runner.arch
     kw = getattr(arch, "_mot_driver_kwargs", None) or {}
     inactive = arch._resolve_inactive_action_dims(None, arch.device) if hasattr(arch, "_resolve_inactive_action_dims") else None
-    return {"engine_config_sha256": cfg_sha(eng.cfg), "architecture": type(arch).__name__, "dtype": str(arch.dtype),
+    from openwam.deploy.engine import _cfg_sha256
+
+    # the engine's own hash: it is what every probe trace records as deploy_config_sha256
+    return {"engine_config_sha256": _cfg_sha256(eng.cfg), "architecture": type(arch).__name__, "dtype": str(arch.dtype),
             "action_dim": int(getattr(arch, "action_dim", -1)),
             "attention": {k: str(kw[k]) for k in sorted(kw) if "mask" in k},
             "schedule": engine_schedule(eng),
