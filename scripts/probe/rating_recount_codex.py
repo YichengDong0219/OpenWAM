@@ -98,7 +98,7 @@ def main():
         pairs[c['obs_id']][c['role']]=c['clip_id'];units[c['clip_id']]=(c['task'],c['episode'])
     assert len(pairs)==30 and all(set(v)=={'receiver','donor'} for v in pairs.values())
     excluded=next(o for o,p in pairs.items() if 'K001' in p.values())
-    calculated={'comparisons':{},'pair_decisions':{},'descriptives':{},'within_pair_fields':{}}
+    calculated={'comparisons':{},'pair_decisions':{},'descriptives':{},'within_pair_fields':{},'per_pair_decisions':{},'legibility_by_task':{}}
     for n,rows in raters.items():
         shape={'legibility':dict(Counter(r['legibility'] for r in rows.values())),'active_arm':dict(Counter(r['active_arm'] for r in rows.values()))}
         for f in FIELDS[1:]:
@@ -108,10 +108,12 @@ def main():
                 if kind=='interval':width[str(v[1]-v[0])]+=1
             shape[f]={'kinds':dict(c),'widths':dict(width)}
         calculated['descriptives'][n]=shape
+        calculated['legibility_by_task'][n]={t:dict(Counter(rows[k]['legibility'] for k in IDS if units[k][0]==t)) for t in sorted({u[0] for u in units.values()})}
     for mode,partial in [('clear_primary',False),('partial_sensitivity',True)]:
         decisions={n:{o:decision(rows[p['receiver']],rows[p['donor']],partial) for o,p in pairs.items()} for n,rows in raters.items()}
         calculated['pair_decisions'][mode]={}
         calculated['within_pair_fields'][mode]={}
+        calculated['per_pair_decisions'][mode]={n:{o:x[0] for o,x in d.items()} for n,d in decisions.items()}
         for n,d in decisions.items():
             calculated['pair_decisions'][mode][n]={tag:dict(Counter(x[0] for o,x in d.items() if tag=='all' or o!=excluded)) for tag in ('all','exclude_K001')}
             calculated['within_pair_fields'][mode][n]={f:count([x[1][f] for x in d.values()]) for f in FIELDS}
@@ -140,6 +142,16 @@ def main():
                 refs=reference['pair_decisions'][mode][n];actual=refs['main' if tag=='all' else 'exclude_potential_unblinding']
                 checks+=1
                 if any(c.get(d,0)!=actual[d] for d in DECISIONS):issues.append('pair_decisions/'+mode+'/'+n+'/'+tag)
+    for mode,names in calculated['per_pair_decisions'].items():
+        for n,d in names.items():
+            checks+=1
+            if d!=reference['pair_decisions'][mode][n]['per_pair']:issues.append('per_pair/'+mode+'/'+n)
+    for n,shape in calculated['descriptives'].items():
+        ref=reference['rater_shape'][n];checks+=1
+        for f in ('legibility','active_arm'):
+            if shape[f]!={k:v for k,v in ref[f].items() if v}:issues.append('rater_shape/'+n+'/'+f)
+        for f in FIELDS[1:]:
+            if shape[f]['kinds']!={k:v for k,v in ref[f]['kinds'].items() if v} or shape[f]['widths']!=ref[f]['interval_length_b_minus_a']:issues.append('rater_shape/'+n+'/'+f)
     human=calculated['within_pair_fields']['clear_primary']['human']
     report={'format':'openwam-codex-independent-rating-recount/1','imports_no_rating_modules':True,'script_sha256':sha(__file__),
             'started_at_utc':started,'finished_at_utc':datetime.now(timezone.utc).isoformat(),'reference_sha256':sha(args.reference),
