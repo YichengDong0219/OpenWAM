@@ -137,7 +137,7 @@ def main():
     for mode,names in calculated['pair_decisions'].items():
         for n,tags in names.items():
             for tag,c in tags.items():
-                refs=reference['pair_decisions'][mode][n];actual=refs['main' if tag=='all' else 'exclude_potential_unblinding']['counts']
+                refs=reference['pair_decisions'][mode][n];actual=refs['main' if tag=='all' else 'exclude_potential_unblinding']
                 checks+=1
                 if any(c.get(d,0)!=actual[d] for d in DECISIONS):issues.append('pair_decisions/'+mode+'/'+n+'/'+tag)
     human=calculated['within_pair_fields']['clear_primary']['human']
