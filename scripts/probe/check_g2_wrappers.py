@@ -343,12 +343,7 @@ class HoldoutChecks(Base):
                                                    "prereg_sha256": psha, "approvals": ap,
                                                    "artifacts": [{"role": r, "path": str(interp), "sha256": C.sha256_file(interp)}
                                                                  for r in ("analysis_script", "interpretation")]})
-        src = self.tmp / "src.pt"
-        pt = FakeRunner().rerun(None, video_seed=1001, action_seed=2001)["probe_trace"]
-        self.src_actions = pt["final"]["actions_physical"]
-        torch.save({"meta": {"format": "openwam-g0-probe-trace/1", "video_seed": 1001, "action_seed": 2001,
-                             "num_frames": 9, "action_num_frames": 33, "denoise_steps": 1, "seed": 42},
-                    "cond": {"prompt": "p"}, "final": {"actions_physical": self.src_actions}}, src)
+        src = self.write_src(42, 42)  # real G0 sources were captured at 42/42, outside the 4x4 grid
         rec = self.write("record.json", {"prompt": "p", "proprio": [0.5] * 20, "pngs": {}, "post_obs": []})
         self.obs = [{"obs_id": "h1", "task": "t", "episode": 0, "split": "holdout", "trace": str(src),
                      "trace_sha256": C.sha256_file(src), "record": str(rec), "record_sha256": C.sha256_file(rec),
@@ -358,6 +353,23 @@ class HoldoutChecks(Base):
                                                        "explore_freeze_sha256": C.sha256_file(self.explore),
                                                        "observations": self.obs})
         self.ap = ap
+        self.manifest = self.write_manifest()
+
+    def write_src(self, v, a):
+        src = self.tmp / "src.pt"
+        pt = FakeRunner().rerun(None, video_seed=v, action_seed=a)["probe_trace"]
+        torch.save({"meta": {"format": "openwam-g0-probe-trace/1", "video_seed": v, "action_seed": a,
+                             "num_frames": 9, "action_num_frames": 33, "denoise_steps": 1, "seed": 42},
+                    "cond": {"prompt": "p"}, "steps": pt["steps"], "final": pt["final"]}, src)
+        return src
+
+    def reseal(self, v, a):
+        """Rewrite the source at other seeds and refresh every hash that names it."""
+        src = self.write_src(v, a)
+        self.obs[0]["trace_sha256"] = C.sha256_file(src)
+        sel = json.loads(self.selection.read_text())
+        sel["observations"] = self.obs
+        self.selection.write_text(json.dumps(sel))
         self.manifest = self.write_manifest()
 
     def write_manifest(self, **over):
@@ -415,9 +427,35 @@ class HoldoutChecks(Base):
 
         with self.assertRaises(SystemExit) as e:
             self.q5(Off()).run()
-        self.assertIn("online source", str(e.exception))
+        self.assertIn("source check failed", str(e.exception))  # out-of-grid 42/42 source is still checked
         idx = self.tmp / "out5" / "index.jsonl"
         self.assertFalse(idx.exists() and idx.read_text().strip())
+        self.assertIn("source_check|h1|42-42", (self.tmp / "out5" / "failures.jsonl").read_text())
+
+    def test_q5_holdout_source_check_journal_and_resume(self):
+        class Good(FakeRunner):
+            pass
+
+        self.q5(Good()).run()
+        notes = (self.tmp / "out5" / "source_checks.jsonl").read_text().splitlines()
+        self.assertEqual(len(notes), 1)
+        self.q5(Good()).run()  # resumed: the source check runs again
+        self.assertEqual(len((self.tmp / "out5" / "source_checks.jsonl").read_text().splitlines()), 2)
+
+    def test_q5_holdout_in_grid_online_baseline_rechecked_on_resume(self):
+        self.reseal(1001, 2001)  # source seeds inside the grid
+        self.q5(FakeRunner()).run()
+        out = self.tmp / "out5"
+        rows = [json.loads(l) for l in (out / "index.jsonl").read_text().splitlines()]
+        row = next(r for r in rows if r["key"] == "baseline|h1|1001-2001")
+        tr = torch.load(row["path"], weights_only=False)
+        tr["final"]["actions_physical"] = tr["final"]["actions_physical"] + 1
+        torch.save(tr, row["path"])
+        row["sha256"] = C.sha256_file(row["path"])
+        (out / "index.jsonl").write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+        with self.assertRaises(SystemExit) as e:
+            self.q5(FakeRunner()).run()
+        self.assertIn("online seeds != source", str(e.exception))
 
     def test_run_gate_rejects_before_runner(self):
         self.manifest = self.write_manifest(status="draft")

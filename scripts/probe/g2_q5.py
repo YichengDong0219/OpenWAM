@@ -25,7 +25,8 @@ No Q5 effect metric is computed here; the analysis (A3) reads the traces.
 ``--split holdout``: observations come from the jointly frozen holdout manifest (checked with the G2
 freeze and the exploration freeze before anything else); the 16 alpha baselines of each new
 observation are generated first (the G1 grid procedure: rerun from the source trace, no replay; the
-one at the source trace's own seeds must equal the online actions), then identity and swaps.
+source trace is first regenerated at its own online seeds and must match bit for bit, on every
+invocation; a grid cell at those seeds is compared on fresh and resumed runs), then identity and swaps.
 """
 
 from __future__ import annotations
@@ -155,10 +156,31 @@ class Q5:
         return {"trace": tr, "ref": {"path": str(path), "sha256": want}}
 
     # -- holdout baselines -------------------------------------------------------------------------
+    def source_check(self, obs: dict) -> None:
+        """Holdout, every invocation (fresh or resumed): regenerate at the source trace's own online seeds
+        (e.g. 42/42, outside the grid), no replay; every step tensor and final action must equal the source."""
+        src = self.source(obs)
+        sm = src["meta"]
+        v, a = int(sm["video_seed"]), int(sm["action_seed"])
+        key = f"source_check|{obs['obs_id']}|{v}-{a}"
+        pt = self.runner.rerun(src, video_seed=v, action_seed=a, record=True)["probe_trace"]
+        bad = identity_mismatches(src, pt)
+        if self.mode == "run" and [list(map(float, s)) for s in pt["schedule"]] != self.runtime["schedule"]:
+            bad.append("schedule")
+        if bad:
+            self.ledger.fail(key, f"offline regeneration at the online seeds differs from the source: {bad[:6]}")
+            raise SystemExit(f"source check failed for {obs['obs_id']} at seeds {v}/{a}: {bad[:6]}")
+        self.ledger.note({"key": key, "obs_id": obs["obs_id"], "source_trace_sha256": obs["trace_sha256"],
+                          "seeds": [v, a], "result": "steps_and_final_bitwise_equal",
+                          "runtime_binding_sha256": self.binding_sha})
+
     def make_baselines(self, obs: dict) -> list:
-        """Holdout only: the 4x4 grid exactly as G1 made it (rerun from the source trace, no replay)."""
+        """Holdout only: the 4x4 grid exactly as G1 made it (rerun from the source trace, no replay), after the
+        source check. A grid cell at the online seeds is compared with the source on fresh AND resumed runs."""
+        self.source_check(obs)
         src, keys = self.source(obs), []
         sm = src["meta"]
+        online_seeds = (int(sm["video_seed"]), int(sm["action_seed"]))
         for v in self.prereg["video_seeds"]:
             for a in self.prereg["action_seeds"]:
                 key = f"baseline|{obs['obs_id']}|{v}-{a}"
@@ -168,7 +190,8 @@ class Q5:
                           "episode": obs["episode"], "source_trace_sha256": obs["trace_sha256"],
                           "video_seed": v, "action_seed": a, "donor": None}
                 keys.append(key)
-                if self.ledger.get(key):
+                fresh = not self.ledger.get(key)
+                if not fresh:
                     tr = self.ledger.load(key)
                     check_meta(tr, expect, key)
                 else:
@@ -184,11 +207,13 @@ class Q5:
                                    "receipts": self.receipts, "role": "baseline"},
                           "cond": src["cond"], "init": pt["init"], "steps": pt["steps"],
                           "final": {**pt["final"], "actions_returned": np.asarray(res["actions"]).copy()}}
-                    online = (int(sm.get("video_seed", -1)), int(sm.get("action_seed", -1))) == (v, a)
-                    if online and not same(np.asarray(pt["final"]["actions_physical"]),
-                                           np.asarray(src["final"]["actions_physical"])):
-                        self.ledger.fail(key, "offline baseline differs from the online source trace at its own seeds")
-                        raise SystemExit(f"offline baseline != online source trace for {key}")
+                if (v, a) == online_seeds:
+                    bad = identity_mismatches(src, tr)
+                    if bad:
+                        if fresh:
+                            self.ledger.fail(key, f"baseline at the online seeds differs from the source: {bad[:6]}")
+                        raise SystemExit(f"baseline at the online seeds != source trace for {key}: {bad[:6]}")
+                if fresh:
                     self.ledger.commit(key, path, tr, kind="baseline", obs_id=obs["obs_id"], task=obs["task"],
                                        episode=obs["episode"], receiver=[v, a], donor=None)
         return keys

@@ -26,7 +26,7 @@ REPO = Path(__file__).resolve().parents[2]
 PROBE_ROOT = (REPO / "outputs" / "probe").resolve()
 BINDING_FORMAT = "openwam-runtime-binding/2"
 MANIFEST_FORMAT = "openwam-runtime-manifest/2"
-LEDGER_FILES = {"RUN_STAMP.json", "index.jsonl", "failures.jsonl"}
+LEDGER_FILES = {"RUN_STAMP.json", "index.jsonl", "failures.jsonl", "source_checks.jsonl"}
 
 
 def sha256_file(path) -> str:
@@ -349,6 +349,10 @@ class Ledger:
 
     def fail(self, key: str, error: str) -> None:
         append_jsonl(self.failures, {"key": key, "error": error})
+
+    def note(self, row: dict) -> None:
+        """Journal of passed engineering checks that are not output units (e.g. holdout source checks)."""
+        append_jsonl(self.out / "source_checks.jsonl", row)
 
     def require_exact(self, expected_keys) -> None:
         got, want = set(self.rows), set(expected_keys)
