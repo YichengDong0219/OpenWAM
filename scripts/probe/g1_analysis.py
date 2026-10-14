@@ -165,7 +165,7 @@ def analyze(prereg,run,split):
         audit=dict(grid_files=len(index),step_rows=len(steps),decoded_clips=len(proxies),frames=frame_count,
                    no_op_max_abs=max(r['noop_vs_recorded']['max_abs'] for r in steps),
                    isolated_max_abs=max((r['isolated_mask_response']['max_abs'] for r in isolated),default=None),
-                   isolated_rows=len(isolated),holdout_loaded=False),
+                   isolated_rows=len(isolated),holdout_loaded=split=='holdout'),
         tasks=bytask,Q1_observations=q1,Q2_observations=q2_observations,isolated_rows=isolated,
         limitations=reg['limitations'],analysis_script_sha256=sha(__file__))
 
@@ -173,7 +173,13 @@ def analyze(prereg,run,split):
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--prereg',required=True,type=Path)
     p.add_argument('--run',required=True,type=Path);p.add_argument('--split',required=True,choices=['explore','holdout'])
-    p.add_argument('--out',required=True,type=Path);a=p.parse_args()
+    p.add_argument('--out',required=True,type=Path)
+    p.add_argument('--explore-freeze',type=Path);a=p.parse_args()
+    if a.split=='holdout':
+        if a.explore_freeze is None:raise SystemExit('holdout analysis requires --explore-freeze')
+        receipt=json.loads(a.explore_freeze.read_text())
+        if receipt.get('prereg_sha256')!=sha(a.prereg) or receipt.get('explore_analysis_frozen') is not True:
+            raise SystemExit('explore freeze receipt does not cover this prereg')
     report=analyze(a.prereg.resolve(),a.run.resolve(),a.split)
     a.out.parent.mkdir(parents=True,exist_ok=True);tmp=a.out.with_suffix('.json.tmp')
     tmp.write_text(json.dumps(report,ensure_ascii=False,indent=2,allow_nan=False)+'\n');tmp.replace(a.out)

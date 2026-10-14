@@ -16,8 +16,14 @@ def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--prereg',required=True,type=Path)
     p.add_argument('--run',required=True,type=Path);p.add_argument('--out',required=True,type=Path)
-    p.add_argument('--split',required=True,choices=['explore','holdout']);a=p.parse_args()
+    p.add_argument('--split',required=True,choices=['explore','holdout'])
+    p.add_argument('--explore-freeze',type=Path);a=p.parse_args()
     reg=json.loads(a.prereg.read_text());digest=sha(a.prereg)
+    if a.split=='holdout':
+        if a.explore_freeze is None:raise SystemExit('holdout rating pack requires --explore-freeze')
+        receipt=json.loads(a.explore_freeze.read_text())
+        if receipt.get('prereg_sha256')!=digest or receipt.get('explore_analysis_frozen') is not True:
+            raise SystemExit('explore freeze receipt does not cover this prereg')
     assert (a.run/'PREREG_SHA256').read_text().strip()==digest
     obs={o['obs_id']:o for o in reg['observations'] if o['split']==a.split}
     clips=[r for r in reg['verification']['rating_clips'] if r['split']==a.split]
