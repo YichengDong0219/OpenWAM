@@ -317,5 +317,134 @@ class BindingChecks(Base):
             g2_q6.Q6(args, "run", runner_factory=self.factory)
 
 
+class HoldoutChecks(Base):
+    """--split holdout: gate before anything else; Q5 makes its own baselines; Q6 GT ids from the selection."""
+
+    def write(self, name, obj):
+        p = self.tmp / name
+        p.write_text(json.dumps(obj))
+        return p
+
+    def setUp(self):
+        super().setUp()
+        self.prereg_path = self.write("prereg.json", {"format": "openwam-g2-prereg/1", "video_seeds": [1001, 1002],
+                                                      "action_seeds": [2001], "pairs": [], "gt_eligibility": {"eligible_explore_obs_ids": []},
+                                                      "provenance": {"g1_prereg": {"sha256": "g1" * 32}}, "observations": []})
+        psha = C.sha256_file(self.prereg_path)
+        appr = self.write("approval.json", {})
+        ap = [{"by": b, "path": str(appr), "sha256": C.sha256_file(appr)} for b in ("codex", "claude")]
+        self.freeze = self.write("freeze.json", {"format": "openwam-g2-freeze-receipt/1", "status": "frozen",
+                                                 "prereg_sha256": psha, "approvals": ap})
+        interp = self.write("interp.md", {})
+        self.explore = self.write("explore.json", {"format": "openwam-g2-explore-freeze-receipt/1", "status": "frozen",
+                                                   "prereg_sha256": psha, "approvals": ap,
+                                                   "artifacts": [{"role": r, "path": str(interp), "sha256": C.sha256_file(interp)}
+                                                                 for r in ("analysis_script", "interpretation")]})
+        src = self.tmp / "src.pt"
+        pt = FakeRunner().rerun(None, video_seed=1001, action_seed=2001)["probe_trace"]
+        self.src_actions = pt["final"]["actions_physical"]
+        torch.save({"meta": {"format": "openwam-g0-probe-trace/1", "video_seed": 1001, "action_seed": 2001},
+                    "cond": {"prompt": "p"}, "final": {"actions_physical": self.src_actions}}, src)
+        rec = self.write("record.json", {"prompt": "p", "proprio": [0.5] * 20, "pngs": {}, "post_obs": []})
+        self.obs = [{"obs_id": "h1", "task": "t", "episode": 0, "split": "holdout", "trace": str(src),
+                     "trace_sha256": C.sha256_file(src), "record": str(rec), "record_sha256": C.sha256_file(rec),
+                     "pngs": [], "gt": {"eligible": False}}]
+        self.selection = self.write("selection.json", {"format": C.HOLDOUT_SELECTION_FORMAT, "prereg_sha256": psha,
+                                                       "freeze_sha256": C.sha256_file(self.freeze),
+                                                       "explore_freeze_sha256": C.sha256_file(self.explore),
+                                                       "observations": self.obs})
+        self.ap = ap
+        self.manifest = self.write_manifest()
+
+    def write_manifest(self, **over):
+        m = {"format": C.HOLDOUT_MANIFEST_FORMAT, "status": "frozen", "prereg_sha256": C.sha256_file(self.prereg_path),
+             "approvals": self.ap, "n_observations": len(self.obs),
+             "selection": {"path": str(self.selection), "sha256": C.sha256_file(self.selection)}}
+        m.update(over)
+        return self.write("holdout_manifest.json", m)
+
+    def gate(self):
+        return C.check_holdout_gate(self.prereg_path, self.freeze, self.explore, self.manifest)
+
+    def test_gate_accepts_and_rejects(self):
+        self.assertEqual(len(self.gate()["observations"]), 1)
+        for over, msg in (({"approvals": self.ap[:1]}, "joint approvals"), ({"n_observations": 2}, "count"),
+                          ({"status": "draft"}, "not a frozen"), ({"selection": {"path": str(self.selection), "sha256": "0" * 64}}, "differs")):
+            self.manifest = self.write_manifest(**over)
+            with self.assertRaises(SystemExit) as e:
+                self.gate()
+            self.assertIn(msg, str(e.exception))
+        self.manifest = self.write_manifest()
+        sel = json.loads(self.selection.read_text())
+        sel["freeze_sha256"] = "0" * 64
+        self.selection.write_text(json.dumps(sel))
+        self.manifest = self.write_manifest()
+        with self.assertRaises(SystemExit) as e:
+            self.gate()
+        self.assertIn("does not name", str(e.exception))
+
+    def q5(self, runner, mode="smoke"):
+        args = argparse.Namespace(prereg=str(self.prereg_path), out=str(self.tmp / "out5"), config=None, n_obs=1,
+                                  freeze_receipt=str(self.freeze), runtime_binding=None, split="holdout",
+                                  explore_freeze=str(self.explore), holdout_manifest=str(self.manifest), selection=str(self.selection))
+        return g2_q5.Q5(args, mode, runner_factory=lambda *_: runner)
+
+    def test_q5_holdout_makes_baselines_then_identity(self):
+        class Good(FakeRunner):
+            def rerun(self, *a, **k):
+                return super().rerun(*a, **{x: y for x, y in k.items() if x != "replay"})
+
+        q = self.q5(Good())
+        q.run()
+        kinds = sorted(r["kind"] for r in q.ledger.rows.values())
+        self.assertEqual(kinds, ["baseline", "baseline", "identity", "identity"])
+        stamp = json.loads((self.tmp / "out5" / "RUN_STAMP.json").read_text())
+        self.assertEqual(stamp["split"], "holdout")
+        self.q5(Good()).run()  # resume re-checks everything, generates nothing new
+
+    def test_q5_holdout_online_source_mismatch_not_indexed(self):
+        class Off(FakeRunner):
+            def rerun(self, *a, **k):
+                r = super().rerun(*a, **{x: y for x, y in k.items() if x != "replay"})
+                r["probe_trace"]["final"]["actions_physical"] = r["probe_trace"]["final"]["actions_physical"] + 1
+                return r
+
+        with self.assertRaises(SystemExit) as e:
+            self.q5(Off()).run()
+        self.assertIn("online source", str(e.exception))
+        idx = self.tmp / "out5" / "index.jsonl"
+        self.assertFalse(idx.exists() and idx.read_text().strip())
+
+    def test_run_gate_rejects_before_runner(self):
+        self.manifest = self.write_manifest(status="draft")
+
+        def factory(*_):
+            raise AssertionError("runner constructed")
+
+        args = argparse.Namespace(prereg=str(self.prereg_path), out=str(self.tmp / "out6"), config=None, n_obs=1,
+                                  freeze_receipt=str(self.freeze), runtime_binding=None, split="holdout",
+                                  explore_freeze=str(self.explore), holdout_manifest=str(self.manifest), selection=None)
+        saved = g2_q6.check_binding
+        g2_q6.check_binding = lambda *a, **k: {"manifest": {}, "runtime_binding": {"sha256": "b" * 64}}
+        try:
+            with self.assertRaises(SystemExit) as e:
+                g2_q6.Q6(args, "run", runner_factory=factory)
+            self.assertIn("not a frozen", str(e.exception))
+            self.assertFalse((self.tmp / "out6").exists())
+        finally:
+            g2_q6.check_binding = saved
+
+    def test_q6_holdout_gt_ids_from_selection(self):
+        self.obs[0]["gt"]["eligible"] = True
+        sel = json.loads(self.selection.read_text())
+        sel["observations"] = self.obs
+        self.selection.write_text(json.dumps(sel))
+        args = argparse.Namespace(prereg=str(self.prereg_path), out=str(self.tmp / "out7"), config=None, n_obs=1,
+                                  freeze_receipt=None, runtime_binding=None, split="holdout",
+                                  explore_freeze=None, holdout_manifest=None, selection=str(self.selection))
+        q = g2_q6.Q6(args, "smoke", runner_factory=lambda *_: FakeRunner())
+        self.assertEqual(q.gt_ids, {"h1"})
+
+
 if __name__ == "__main__":
     unittest.main()

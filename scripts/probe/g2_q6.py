@@ -18,6 +18,9 @@ No Q6 effect metric is computed here; A3 reads the traces.
     describe : load the model and write the runtime description to --out (for the manifest)
     smoke    : source + baseline + identity (+ GT future construction) on the first N observations
     run      : formal
+
+``--split holdout``: observations (and their audited GT eligibility) come from the jointly frozen
+holdout manifest, checked with the G2 freeze and the exploration freeze before anything else.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts" / "probe"))
 
 from g2_common import (Ledger, check_binding, check_imports_bound, check_meta, check_runtime,  # noqa: E402
-                       describe_runtime, same, sha256_file, write_description)
+                       describe_runtime, holdout_observations, same, sha256_file, write_description)
 
 IDM_CKPT = REPO / "assets/openwam_ckpt/openwam_study/robotwin_dual_system_idm"
 DEFAULT_CONFIG = REPO / "configs/deploy_probe.yaml"
@@ -84,15 +87,24 @@ class Q6:
             self.receipts = {"freeze_receipt": {"path": str(Path(args.freeze_receipt).resolve()),
                                                 "sha256": sha256_file(args.freeze_receipt)}, **bound}
         self.binding_sha = self.receipts.get("runtime_binding", {}).get("sha256")
-        self.gt_ids = set(self.prereg["gt_eligibility"]["eligible_explore_obs_ids"])
-        obs = self.prereg["observations"]
-        self.observations = obs[: args.n_obs] if mode == "smoke" else obs
+        self.split = getattr(args, "split", "explore") or "explore"
+        stamp = {"prereg_sha256": self.prereg_sha, "mode": mode, "runtime_binding_sha256": self.binding_sha}
+        if self.split == "holdout":
+            self.observations, refs = holdout_observations(args, mode, self.prereg_path)
+            self.receipts.update(refs)
+            # the selection carries each new observation's audited GT eligibility
+            self.gt_ids = {o["obs_id"] for o in self.observations if o["gt"]["eligible"] is True}
+            stamp.update(split="holdout", holdout_refs=refs)
+        else:
+            self.gt_ids = set(self.prereg["gt_eligibility"]["eligible_explore_obs_ids"])
+            obs = self.prereg["observations"]
+            self.observations = obs[: args.n_obs] if mode == "smoke" else obs
         self.records = {}
         for o in self.observations:
             if sha256_file(o["record"]) != o["record_sha256"]:
                 raise SystemExit(f"record sha mismatch for {o['obs_id']}")
             self.records[o["obs_id"]] = json.loads(Path(o["record"]).read_text())
-        self.ledger = Ledger(args.out, {"prereg_sha256": self.prereg_sha, "mode": mode, "runtime_binding_sha256": self.binding_sha})
+        self.ledger = Ledger(args.out, stamp)
         self.runner = runner_factory(IDM_CKPT, self.config)
         if "idm" not in type(self.runner.arch).__name__.lower():
             raise SystemExit(f"checkpoint is not an IDM architecture: {type(self.runner.arch).__name__}")
@@ -336,6 +348,10 @@ def main(argv=None):
     p.add_argument("--runtime-binding")
     p.add_argument("--config", default=None)
     p.add_argument("--n-obs", type=int, default=1, help="smoke only: first N observations")
+    p.add_argument("--split", choices=["explore", "holdout"], default="explore")
+    p.add_argument("--explore-freeze", help="holdout run: jointly frozen exploration receipt")
+    p.add_argument("--holdout-manifest", help="holdout run: jointly frozen holdout manifest receipt")
+    p.add_argument("--selection", help="holdout smoke only: a selection file (no gate, no alt/gt runs)")
     args = p.parse_args(argv)
     if args.mode == "describe":
         if not args.out:

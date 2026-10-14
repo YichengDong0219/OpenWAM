@@ -139,6 +139,72 @@ def check_binding(binding_path, prereg_path, scope: str, config: str, ckpt_dir: 
             "manifest": man}
 
 
+HOLDOUT_MANIFEST_FORMAT = "openwam-g2-holdout-manifest-receipt/1"
+HOLDOUT_SELECTION_FORMAT = "openwam-g2-holdout-selection/1"
+
+
+def _frozen_jointly(path, fmt: str, prereg_sha: str) -> dict:
+    r = json.loads(Path(path).read_text())
+    if r.get("format") != fmt or r.get("status") != "frozen" or r.get("prereg_sha256") != prereg_sha:
+        raise SystemExit(f"{Path(path).name}: not a frozen {fmt} for this prereg")
+    approvals = r.get("approvals") or []
+    if {a.get("by") for a in approvals} != {"codex", "claude"}:
+        raise SystemExit(f"{Path(path).name}: joint approvals required")
+    for a in approvals:
+        if not is_hex64(a.get("sha256")) or sha256_file(a["path"]) != a["sha256"]:
+            raise SystemExit(f"{Path(path).name}: approval artifact changed: {a.get('path')}")
+    return r
+
+
+def check_holdout_gate(prereg_path, freeze_receipt, explore_freeze, holdout_manifest) -> dict:
+    """Before any holdout work: G2 freeze, exploration freeze and the jointly frozen holdout manifest,
+    whose selection must name this prereg and these two receipts. Returns observations and references."""
+    prereg_sha = sha256_file(prereg_path)
+    _frozen_jointly(freeze_receipt, "openwam-g2-freeze-receipt/1", prereg_sha)
+    ex = _frozen_jointly(explore_freeze, "openwam-g2-explore-freeze-receipt/1", prereg_sha)
+    roles = {a.get("role") for a in ex.get("artifacts", [])}
+    if not {"analysis_script", "interpretation"} <= roles:
+        raise SystemExit("exploration freeze lacks analysis/interpretation artifacts")
+    for a in ex["artifacts"]:
+        if sha256_file(a["path"]) != a["sha256"]:
+            raise SystemExit(f"exploration freeze artifact changed: {a['path']}")
+    hm = _frozen_jointly(holdout_manifest, HOLDOUT_MANIFEST_FORMAT, prereg_sha)
+    sel_ref = hm.get("selection") or {}
+    if not is_hex64(sel_ref.get("sha256")) or sha256_file(sel_ref["path"]) != sel_ref["sha256"]:
+        raise SystemExit("holdout selection differs from the frozen manifest")
+    sel = json.loads(Path(sel_ref["path"]).read_text())
+    if (sel.get("format") != HOLDOUT_SELECTION_FORMAT or sel.get("prereg_sha256") != prereg_sha
+            or sel.get("freeze_sha256") != sha256_file(freeze_receipt)
+            or sel.get("explore_freeze_sha256") != sha256_file(explore_freeze)):
+        raise SystemExit("holdout selection does not name this prereg and these freeze receipts")
+    obs = sel.get("observations") or []
+    ids = [o["obs_id"] for o in obs]
+    if not obs or len(set(ids)) != len(ids) or any(o.get("split") != "holdout" for o in obs):
+        raise SystemExit("holdout selection observations empty, duplicated or not split=holdout")
+    expected = hm.get("n_observations")
+    if not isinstance(expected, int) or expected != len(obs):
+        raise SystemExit("holdout manifest observation count does not match the selection")
+    print(f"[holdout] gate verified: {len(obs)} observations, selection {sel_ref['sha256'][:12]}", flush=True)
+    return {"observations": obs,
+            "refs": {"explore_freeze": {"path": str(Path(explore_freeze).resolve()), "sha256": sha256_file(explore_freeze)},
+                     "holdout_manifest": {"path": str(Path(holdout_manifest).resolve()), "sha256": sha256_file(holdout_manifest)},
+                     "holdout_selection": {"path": sel_ref["path"], "sha256": sel_ref["sha256"]}}}
+
+
+def holdout_observations(args, mode: str, prereg_path) -> tuple[list, dict]:
+    """Observations for --split holdout: gated in run mode; smoke reads an unfrozen selection file."""
+    if mode == "run":
+        if not (args.explore_freeze and args.holdout_manifest):
+            raise SystemExit("holdout run needs --explore-freeze and --holdout-manifest")
+        g = check_holdout_gate(prereg_path, args.freeze_receipt, args.explore_freeze, args.holdout_manifest)
+        return g["observations"], g["refs"]
+    if not args.selection:
+        raise SystemExit("holdout smoke needs --selection")
+    sel = json.loads(Path(args.selection).read_text())
+    return sel["observations"][: args.n_obs], {"smoke_selection": {"path": str(Path(args.selection).resolve()),
+                                                                     "sha256": sha256_file(args.selection)}}
+
+
 # -- runtime description --------------------------------------------------------------------------
 def engine_schedule(engine) -> list:
     """The schedule ``DeployEngine.generate`` builds for a request without overrides."""

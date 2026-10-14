@@ -21,6 +21,11 @@ No Q5 effect metric is computed here; the analysis (A3) reads the traces.
     describe : load the model and write the runtime description to --out (for the manifest)
     smoke    : identity replays only on the first N observations (no swap, no binding)
     run      : formal
+
+``--split holdout``: observations come from the jointly frozen holdout manifest (checked with the G2
+freeze and the exploration freeze before anything else); the 16 alpha baselines of each new
+observation are generated first (the G1 grid procedure: rerun from the source trace, no replay; the
+one at the source trace's own seeds must equal the online actions), then identity and swaps.
 """
 
 from __future__ import annotations
@@ -38,7 +43,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts" / "probe"))
 
 from g2_common import (Ledger, check_binding, check_imports_bound, check_meta, check_runtime,  # noqa: E402
-                       describe_runtime, same, sha256_file, write_description)
+                       describe_runtime, holdout_observations, same, sha256_file, write_description)
 
 ALPHA_CKPT = REPO / "assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-RoboTwin-Full"
 DEFAULT_CONFIG = REPO / "configs/deploy_probe.yaml"
@@ -83,14 +88,23 @@ class Q5:
                                                 "sha256": sha256_file(args.freeze_receipt)}, **bound}
         self.manifest = manifest
         self.binding_sha = self.receipts.get("runtime_binding", {}).get("sha256")
-        self.g1_prereg_sha = self.prereg["provenance"]["g1_prereg"]["sha256"]
-        self.baseline_index = self._baseline_indexes()
-        obs = self.prereg["observations"]
-        self.observations = obs[: args.n_obs] if mode == "smoke" else obs
+        self.split = getattr(args, "split", "explore") or "explore"
+        stamp = {"prereg_sha256": self.prereg_sha, "mode": mode, "runtime_binding_sha256": self.binding_sha}
+        if self.split == "holdout":
+            # no G1 grid exists for new episodes: the 16 alpha baselines are generated here first
+            self.observations, refs = holdout_observations(args, mode, self.prereg_path)
+            self.receipts.update(refs)
+            self.baseline_index = None
+            stamp.update(split="holdout", holdout_refs=refs)
+        else:
+            self.g1_prereg_sha = self.prereg["provenance"]["g1_prereg"]["sha256"]
+            self.baseline_index = self._baseline_indexes()
+            obs = self.prereg["observations"]
+            self.observations = obs[: args.n_obs] if mode == "smoke" else obs
         for o in self.observations:
             if sha256_file(o["trace"]) != o["trace_sha256"]:
                 raise SystemExit(f"source trace sha mismatch for {o['obs_id']}")
-        self.ledger = Ledger(args.out, {"prereg_sha256": self.prereg_sha, "mode": mode, "runtime_binding_sha256": self.binding_sha})
+        self.ledger = Ledger(args.out, stamp)
         self.runner = runner_factory(ALPHA_CKPT, self.config)
         self.runtime = check_runtime(self.runner, manifest) if mode == "run" else describe_runtime(self.runner)
         from openwam.deploy.engine import _code_version
@@ -122,6 +136,12 @@ class Q5:
         return self._sources[obs["obs_id"]]
 
     def baseline(self, obs: dict, v: int, a: int) -> dict:
+        if self.split == "holdout":
+            key = f"baseline|{obs['obs_id']}|{v}-{a}"
+            row = self.ledger.get(key)
+            if row is None:
+                raise RuntimeError(f"holdout baseline not generated yet: {key}")
+            return {"trace": self.ledger.load(key), "ref": {"path": row["path"], "sha256": row["sha256"]}}
         root = Path(self.prereg["alpha_baseline_sources"][obs["source_g1_split"]]["root"])
         path = root / obs["task"] / obs["obs_id"] / "grid" / f"v{v}_a{a}.pt"
         want = self.baseline_index.get(str(path))
@@ -133,6 +153,43 @@ class Q5:
                 or int(m["video_seed"]) != v or int(m["action_seed"]) != a):
             raise RuntimeError(f"baseline identity mismatch: {path}")
         return {"trace": tr, "ref": {"path": str(path), "sha256": want}}
+
+    # -- holdout baselines -------------------------------------------------------------------------
+    def make_baselines(self, obs: dict) -> list:
+        """Holdout only: the 4x4 grid exactly as G1 made it (rerun from the source trace, no replay)."""
+        src, keys = self.source(obs), []
+        sm = src["meta"]
+        for v in self.prereg["video_seeds"]:
+            for a in self.prereg["action_seeds"]:
+                key = f"baseline|{obs['obs_id']}|{v}-{a}"
+                path = self.ledger.out / obs["task"] / obs["obs_id"] / "baseline" / f"v{v}_a{a}.pt"
+                expect = {"format": FORMAT, "kind": "baseline", "prereg_sha256": self.prereg_sha,
+                          "runtime_binding_sha256": self.binding_sha, "obs_id": obs["obs_id"], "task": obs["task"],
+                          "episode": obs["episode"], "source_trace_sha256": obs["trace_sha256"],
+                          "video_seed": v, "action_seed": a, "donor": None}
+                keys.append(key)
+                if self.ledger.get(key):
+                    tr = self.ledger.load(key)
+                    check_meta(tr, expect, key)
+                else:
+                    res = self.runner.rerun(src, video_seed=v, action_seed=a, record=True)
+                    pt = res["probe_trace"]
+                    if self.mode == "run" and [list(map(float, s)) for s in pt["schedule"]] != self.runtime["schedule"]:
+                        raise SystemExit(f"generation schedule differs from the bound runtime for {key}")
+                    tr = {"meta": {**expect, "schedule": pt["schedule"], "active_action_mask": pt["active_action_mask"],
+                                   "runtime_code": self.runtime_code,
+                                   "runtime_engine_config_sha256": self.runtime["engine_config_sha256"],
+                                   "receipts": self.receipts, "role": "baseline"},
+                          "cond": src["cond"], "init": pt["init"], "steps": pt["steps"],
+                          "final": {**pt["final"], "actions_returned": np.asarray(res["actions"]).copy()}}
+                    online = (int(sm.get("video_seed", -1)), int(sm.get("action_seed", -1))) == (v, a)
+                    if online and not same(np.asarray(pt["final"]["actions_physical"]),
+                                           np.asarray(src["final"]["actions_physical"])):
+                        self.ledger.fail(key, "offline baseline differs from the online source trace at its own seeds")
+                        raise SystemExit(f"offline baseline != online source trace for {key}")
+                    self.ledger.commit(key, path, tr, kind="baseline", obs_id=obs["obs_id"], task=obs["task"],
+                                       episode=obs["episode"], receiver=[v, a], donor=None)
+        return keys
 
     # -- units -----------------------------------------------------------------------------------
     def expect(self, obs, kind, vr, ar, vd, ad, base_r, base_d) -> dict:
@@ -186,6 +243,8 @@ class Q5:
     def run(self) -> None:
         expected = []
         for obs in self.observations:
+            if self.split == "holdout":
+                expected += self.make_baselines(obs)
             for kind, key, path, vr, ar, vd, ad in self.keys(obs):
                 self.unit(obs, kind, key, path, vr, ar, vd, ad)
                 expected.append(key)
@@ -205,6 +264,10 @@ def main(argv=None):
     p.add_argument("--runtime-binding")
     p.add_argument("--config", default=None)
     p.add_argument("--n-obs", type=int, default=1, help="smoke only: first N observations")
+    p.add_argument("--split", choices=["explore", "holdout"], default="explore")
+    p.add_argument("--explore-freeze", help="holdout run: jointly frozen exploration receipt")
+    p.add_argument("--holdout-manifest", help="holdout run: jointly frozen holdout manifest receipt")
+    p.add_argument("--selection", help="holdout smoke only: a selection file (no gate, no swaps)")
     args = p.parse_args(argv)
     if args.mode == "describe":
         if not args.out:
