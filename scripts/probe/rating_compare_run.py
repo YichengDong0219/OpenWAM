@@ -4,12 +4,20 @@ Loads sealed rater files, the private pair mapping and the frozen comparison
 receipt, then reports the three fixed comparisons with rating_compare.py and
 rating_rules_v2.py. Adds only what the rules require beyond those pure
 functions: strict loading, episode->task equal-weight description and per-rater
-label-shape descriptives. Refuses to overwrite its output.
+label-shape descriptives.
+
+Every binding is checked BEFORE any rating file is parsed (R21 review): receipt
+status/signatures, the exact four code hashes, rules doc/candidate, seal manifest
+and its three sealed inputs, the private mapping, raw rating-file hashes and the
+absence of the output. The first label parse and the end of the analysis are
+timestamped (UTC) in a journal that never carries label values.
 """
 import argparse
 import hashlib
 import json
 import os
+import re
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -21,10 +29,23 @@ CLIPS = [f'K{i:03d}' for i in range(1, 61)]
 EVENTS = FIELDS[1:]
 COMPARISONS = (('human', 'ai1'), ('human', 'ai2'), ('ai1', 'ai2'))
 MODES = (('clear_primary', False), ('partial_sensitivity', True))
+CODE_FILES = ('rating_compare_run.py', 'rating_compare.py', 'rating_rules.py', 'rating_rules_v2.py')
+SEALED = {'human': ('sealed_human/rater_human_C.jsonl', ('human', 'C')),
+          'ai1': ('sealed_ai/rater_ai1.jsonl', ('ai', 'rater_ai1')),
+          'ai2': ('sealed_ai/rater_ai2.jsonl', ('ai', 'rater_ai2'))}
+HEX64 = re.compile(r'[0-9a-f]{64}')
 
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def utc():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def is_hex64(x):
+    return isinstance(x, str) and HEX64.fullmatch(x) is not None
 
 
 def load_rater(path, expected_sha):
@@ -55,11 +76,20 @@ def load_rater(path, expected_sha):
 
 def load_pairs(mapping_path):
     clips = json.loads(Path(mapping_path).read_text())['clips']
-    by_obs = defaultdict(dict)
+    if not isinstance(clips, list) or len(clips) != 60:
+        raise ValueError('mapping must have exactly 60 clips')
+    seen, by_obs = set(), defaultdict(dict)
     for c in clips:
-        if c['pack'] != 'C' or c['clip_id'] not in CLIPS or c['role'] in by_obs[c['obs_id']]:
-            raise ValueError('mapping identity')
+        if c.get('pack') != 'C' or c.get('clip_id') not in CLIPS or c['clip_id'] in seen:
+            raise ValueError('mapping clip identity')
+        if c.get('role') not in ('receiver', 'donor') or c['role'] in by_obs[c.get('obs_id')]:
+            raise ValueError('mapping role')
+        if not isinstance(c.get('task'), str) or isinstance(c.get('episode'), bool) or not isinstance(c.get('episode'), int):
+            raise ValueError('mapping task/episode type')
+        seen.add(c['clip_id'])
         by_obs[c['obs_id']][c['role']] = c
+    if len(by_obs) != 30 or any(set(r) != {'receiver', 'donor'} for r in by_obs.values()):
+        raise ValueError('mapping must have 30 observations with exactly one receiver and one donor')
     pairs = []
     for obs, roles in sorted(by_obs.items()):
         r, d = roles['receiver'], roles['donor']
@@ -67,8 +97,6 @@ def load_pairs(mapping_path):
             raise ValueError('pair crosses episode: '+obs)
         pairs.append({'pair_id': obs, 'receiver': ('C', r['clip_id']), 'donor': ('C', d['clip_id']),
                       'task': r['task'], 'episode': r['episode']})
-    if len(pairs) != 30 or sorted(k for p in pairs for k in (p['receiver'][1], p['donor'][1])) != CLIPS:
-        raise ValueError('expected 30 pairs covering K001..K060')
     clip_unit = {c['clip_id']: (c['task'], c['episode']) for c in clips}
     return pairs, clip_unit
 
@@ -95,18 +123,29 @@ def hierarchy(statuses, units):
 
 
 def rater_shape(rows):
-    out = {'n_rows': len(rows), 'legibility': dict(Counter(r['legibility'] for r in rows.values())),
-           'active_arm': dict(Counter(arm(r.get('active_arm'))[1] or arm(r.get('active_arm'))[0]
-                                      for r in rows.values()))}
+    """Distributions over the fixed 60 ids; a whole missing row is counted as 'missing_row'."""
+    present = [rows[k] for k in CLIPS if k in rows]
+    n_missing = len(CLIPS) - len(present)
+    leg = Counter(r['legibility'] for r in present)
+    arms = Counter()
+    for r in present:
+        status, v = arm(r.get('active_arm'))
+        arms[v if status == 'known' else status] += 1
+    out = {'n_ids': len(CLIPS), 'n_rows': len(present), 'n_missing_rows': n_missing,
+           'legibility': {**leg, 'missing_row': n_missing}, 'active_arm': {**arms, 'missing_row': n_missing}}
     for f in EVENTS:
         kinds, lengths = Counter(), Counter()
-        for r in rows.values():
+        for r in present:
             status, v = event(r.get(f))
             kind = status if status != 'known' else ('none' if v is None else 'interval')
             kinds[kind] += 1
             if kind == 'interval':
                 lengths[v[1]-v[0]] += 1
-        out[f] = {'kinds': dict(kinds), 'interval_length_b_minus_a': {str(k): lengths[k] for k in sorted(lengths)}}
+        kinds['missing_row'] = n_missing
+        if sum(kinds.values()) != len(CLIPS):
+            raise AssertionError('event kinds must sum to 60')
+        out[f] = {'kinds': dict(kinds), 'n_intervals': sum(lengths.values()),
+                  'interval_length_b_minus_a': {str(k): lengths[k] for k in sorted(lengths)}}
     return out
 
 
@@ -147,41 +186,94 @@ def analyse(raters, pairs, clip_unit):
     return out
 
 
+def preflight(args, code_dir):
+    """All checks that need no rating parse. Returns the bound inputs; raises SystemExit on any mismatch."""
+    receipt_path = Path(args.freeze_receipt)
+    receipt = json.loads(receipt_path.read_text())
+    if receipt.get('format') != 'openwam-human-ai-comparison-freeze/1' or receipt.get('status') != 'jointly_frozen':
+        raise SystemExit('comparison rules not jointly frozen')
+    sig = receipt.get('signatures') or {}
+    if not all(isinstance(sig.get(k), str) and sig[k].strip() for k in ('claude', 'codex')):
+        raise SystemExit('freeze receipt lacks both signatures')
+    code = receipt.get('code_sha256')
+    if not isinstance(code, dict) or set(code) != set(CODE_FILES) or not all(is_hex64(v) for v in code.values()):
+        raise SystemExit('freeze receipt must bind exactly the four code files with sha256 values')
+    for name in CODE_FILES:
+        if sha(code_dir/name) != code[name]:
+            raise SystemExit(f'code differs from frozen receipt: {name}')
+    for arg, key in (('rules_doc', 'rules_doc_sha256'), ('candidate', 'candidate_json_sha256')):
+        if not is_hex64(receipt.get(key)) or sha(getattr(args, arg)) != receipt[key]:
+            raise SystemExit(f'{key} mismatch')
+    for key in ('seal_manifest_sha256', 'mapping_sha256'):
+        if not is_hex64(receipt.get(key)):
+            raise SystemExit(f'freeze receipt lacks {key}')
+    if sha(args.seal_manifest) != receipt['seal_manifest_sha256']:
+        raise SystemExit('seal manifest differs from frozen receipt')
+    seal = json.loads(Path(args.seal_manifest).read_text())
+    bound = receipt.get('sealed_inputs') or {}
+    root = Path(args.pack_root)
+    files = {}
+    for name, (rel, (top, sub)) in SEALED.items():
+        h = seal[top][sub]['sha256']
+        if not is_hex64(bound.get(name)) or h != bound[name]:
+            raise SystemExit(f'seal manifest / receipt disagree for {name}')
+        if sha(root/rel) != h:
+            raise SystemExit(f'sealed file changed: {name}')
+        files[name] = (root/rel, h)
+    if set(bound) != set(SEALED):
+        raise SystemExit('receipt sealed_inputs must name exactly human, ai1, ai2')
+    mapping = root/'private/mapping.json'
+    if sha(mapping) != receipt['mapping_sha256']:
+        raise SystemExit('private mapping differs from frozen receipt')
+    out, journal = Path(args.out), Path(args.out).with_suffix('.journal.json')
+    if out.exists() or journal.exists():
+        raise SystemExit('refusing to overwrite '+str(out))
+    return {'receipt_sha256': sha(receipt_path), 'files': files, 'mapping': mapping, 'out': out, 'journal': journal,
+            'code_sha256': dict(code), 'seal_manifest_sha256': receipt['seal_manifest_sha256'],
+            'mapping_sha256': receipt['mapping_sha256'], 'rules_doc_sha256': receipt['rules_doc_sha256'],
+            'candidate_json_sha256': receipt['candidate_json_sha256']}
+
+
+def write_json(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1, sort_keys=True))
+    os.replace(tmp, path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--pack-root', required=True)
     ap.add_argument('--freeze-receipt', required=True)
     ap.add_argument('--seal-manifest', required=True)
+    ap.add_argument('--rules-doc', required=True)
+    ap.add_argument('--candidate', required=True)
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
-    root = Path(args.pack_root)
-    receipt = json.loads(Path(args.freeze_receipt).read_text())
-    if receipt.get('status') != 'jointly_frozen':
-        raise SystemExit('comparison rules not jointly frozen')
-    here = Path(__file__).resolve().parent
-    for name, digest in receipt['code_sha256'].items():
-        if sha(here/name) != digest:
-            raise SystemExit(f'code differs from frozen receipt: {name}')
-    seal = json.loads(Path(args.seal_manifest).read_text())
-    files = {'human': (root/'sealed_human/rater_human_C.jsonl', seal['human']['C']['sha256']),
-             'ai1': (root/'sealed_ai/rater_ai1.jsonl', seal['ai']['rater_ai1']['sha256']),
-             'ai2': (root/'sealed_ai/rater_ai2.jsonl', seal['ai']['rater_ai2']['sha256'])}
-    raters = {n: load_rater(p, h) for n, (p, h) in files.items()}
-    pairs, clip_unit = load_pairs(root/'private/mapping.json')
-    result = analyse(raters, pairs, clip_unit)
-    result['provenance'] = {'freeze_receipt_sha256': sha(args.freeze_receipt), 'seal_manifest_sha256': sha(args.seal_manifest),
-                            'inputs': {n: {'path': str(p), 'sha256': h} for n, (p, h) in files.items()},
-                            'mapping_sha256': sha(root/'private/mapping.json'),
-                            'code_sha256': {n: sha(here/n) for n in ('rating_compare_run.py', 'rating_compare.py',
-                                                                      'rating_rules.py', 'rating_rules_v2.py')}}
-    out = Path(args.out)
-    if out.exists():
-        raise SystemExit('refusing to overwrite '+str(out))
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix('.tmp')
-    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=1, sort_keys=True))
-    os.replace(tmp, out)
-    print(json.dumps({'written': str(out), 'sha256': sha(out)}))
+    b = preflight(args, Path(__file__).resolve().parent)
+    pairs, clip_unit = load_pairs(b['mapping'])  # identity only; hash already bound
+    inputs = {n: {'path': str(p), 'sha256': h} for n, (p, h) in b['files'].items()}
+    journal = {'label_read_started_at': utc(), 'inputs': inputs, 'freeze_receipt_sha256': b['receipt_sha256'],
+               'status': 'started'}
+    write_json(b['journal'], journal)
+    try:
+        raters = {n: load_rater(p, h) for n, (p, h) in b['files'].items()}
+        result = analyse(raters, pairs, clip_unit)
+    except Exception as e:
+        journal.update(status='failed', failed_at=utc(), error_type=type(e).__name__)
+        write_json(b['journal'], journal)
+        raise SystemExit(f'analysis failed ({type(e).__name__}); see journal')
+    journal.update(status='finished', analysis_finished_at=utc())
+    result['provenance'] = {'freeze_receipt_sha256': b['receipt_sha256'], 'seal_manifest_sha256': b['seal_manifest_sha256'],
+                            'mapping_sha256': b['mapping_sha256'], 'rules_doc_sha256': b['rules_doc_sha256'],
+                            'candidate_json_sha256': b['candidate_json_sha256'], 'inputs': inputs,
+                            'code_sha256': b['code_sha256'],
+                            'label_read_started_at': journal['label_read_started_at'],
+                            'analysis_finished_at': journal['analysis_finished_at']}
+    write_json(b['out'], result)
+    journal['result_sha256'] = sha(b['out'])
+    write_json(b['journal'], journal)
+    print(json.dumps({'written': str(b['out']), 'sha256': journal['result_sha256']}))
 
 
 if __name__ == '__main__':
