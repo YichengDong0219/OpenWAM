@@ -121,8 +121,8 @@ def run_wrappers(tmp, hm, binds):
     return outs
 
 
-def adapter(tmp, hm, binds, outs, tag):
-    cmd = [sys.executable, str(HERE / "g2_holdout_analysis_codex.py"), "--prereg", str(PREREG), "--freeze", str(FREEZE),
+def adapter(tmp, hm, binds, outs, tag, optimize=False):
+    cmd = [sys.executable] + (["-O"] if optimize else []) + [str(HERE / "g2_holdout_analysis_codex.py"), "--prereg", str(PREREG), "--freeze", str(FREEZE),
            "--explore-freeze", str(EXPLORE), "--holdout-manifest", str(hm), "--q5", str(outs["q5"]), "--q6", str(outs["q6"]),
            "--q5-binding", str(binds["Q5_alpha"]), "--q6-binding", str(binds["Q6_idm"]), "--out", str(tmp / f"analysis_{tag}")]
     p = subprocess.run(cmd, capture_output=True, text=True, cwd=str(HERE))
@@ -143,16 +143,35 @@ def main():
         report["q5_extra_files"] = sorted(p.name for p in outs["q5"].iterdir() if p.is_file())
         code, last = adapter(tmp, hm, binds, outs, "as_written")
         report["adapter_as_written"] = {"returncode": code, "last_stderr": last}
-        # isolate: same outputs without my source-check journal (moved out, not deleted from evidence)
-        journal = outs["q5"] / "source_checks.jsonl"
-        if journal.exists():
-            shutil.move(str(journal), str(tmp / "source_checks_q5.jsonl"))
-        code2, last2 = adapter(tmp, hm, binds, outs, "without_journal")
-        report["adapter_without_source_journal"] = {"returncode": code2, "last_stderr": last2}
-        if code2 == 0:
-            res = json.loads((tmp / "analysis_without_journal" / "analysis.json").read_text())
+        if code == 0:
+            res = json.loads((tmp / "analysis_as_written" / "analysis.json").read_text())
             report["adapter_counts"] = res["counts"]
             report["gt_groups_tasks"] = {t: v.get("n_rows") for t, v in res["groups"]["GT_command_consistency"]["tasks"].items()}
+        journal = outs["q5"] / "source_checks.jsonl"
+        good = journal.read_text()
+        lines = good.splitlines()
+
+        def case(tag, text=None, extra_file=None, optimize=False):
+            if text is not None:
+                journal.write_text(text)
+            if extra_file:
+                (outs["q5"] / extra_file).write_text('{"key": "x", "error": "synthetic"}\n')
+            c, l = adapter(tmp, hm, binds, outs, tag, optimize=optimize)
+            journal.write_text(good)
+            if extra_file:
+                (outs["q5"] / extra_file).unlink()
+            return {"returncode": c, "last_stderr": l}
+
+        bad_result = json.loads(lines[3])
+        bad_result["result"] = "differs"
+        report["neg_wrong_result"] = case("neg_result", "\n".join(lines[:3] + [json.dumps(bad_result)] + lines[4:]) + "\n")
+        bad_bind = json.loads(lines[5])
+        bad_bind["runtime_binding_sha256"] = "0" * 64
+        report["neg_wrong_binding"] = case("neg_bind", "\n".join(lines[:5] + [json.dumps(bad_bind)] + lines[6:]) + "\n")
+        report["neg_partial_last_invocation"] = case("neg_partial", good + "\n".join(lines[:5]) + "\n")
+        report["pos_two_complete_invocations"] = case("pos_twice", good + good)
+        report["neg_failures_file"] = case("neg_failures", extra_file="failures.jsonl")
+        report["neg_missing_journal_python_O"] = case("neg_missing_O", text="", optimize=True)
     finally:
         if a.keep:
             print("kept", tmp)
