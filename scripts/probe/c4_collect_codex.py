@@ -122,6 +122,7 @@ def main():
     for manifest_path in (ROOT/"outputs/probe").glob("**/manifest.json"):
         try:old=json.loads(manifest_path.read_text())
         except (ValueError, OSError):continue
+        if not isinstance(old,dict):continue
         task=old.get("task")
         if old.get("benchmark") == "robotwin" and task in starts:
             for entry in old.get("entries",[]):
