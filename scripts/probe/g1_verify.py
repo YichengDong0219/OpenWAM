@@ -43,6 +43,7 @@ def response(swapped, base, dims):
                 base_l2=b,base_rms=float(np.sqrt((y@y)/len(y))),rel_l2=n/b if b else None)
 
 
+@torch.no_grad()
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--prereg',required=True,type=Path);p.add_argument('--run',required=True,type=Path)
@@ -70,7 +71,8 @@ def main():
     for o in selected:
         src=sources[o['obs_id']]; traces={}; reruns={}; before=len(errors)
         for v in (vr,vd):
-            saved=load_trace(args.run/o['task']/o['obs_id']/'grid'/f'v{v}_a{ar}.pt')
+            saved=torch.load(args.run/o['task']/o['obs_id']/'grid'/f'v{v}_a{ar}.pt',map_location='cpu',weights_only=False)
+            assert saved['meta']['format']=='openwam-g1-generation/1'
             assert saved['meta']['prereg_sha256']==digest and saved['meta']['source_trace_sha256']==o['trace_sha256']
             assert saved['meta']['runtime_code']['dirty'] is False
             new=runner.rerun(src,video_seed=v,action_seed=ar,record=True);pt=new['probe_trace']
