@@ -23,11 +23,11 @@ def main():
   _,_,refs=H.load_inputs(P,F,E,receipt);passed.append('joint frozen fixture accepted without effect reads')
   orig=json.loads(receipt.read_text());bad=dict(orig,status='draft');put(receipt,bad)
   try:H.load_inputs(P,F,E,receipt)
-  except AssertionError:passed.append('draft holdout receipt rejected')
+  except ValueError:passed.append('draft holdout receipt rejected')
   else:raise AssertionError('draft accepted')
   put(receipt,orig);broken=dict(orig,selection={'path':str(selection),'sha256':'0'*64});put(receipt,broken)
   try:H.load_inputs(P,F,E,receipt)
-  except AssertionError:passed.append('wrong selection hash rejected')
+  except ValueError:passed.append('wrong selection hash rejected')
   else:raise AssertionError('bad SHA accepted')
   put(receipt,orig)
   seeds=[(v,a) for v in pre['video_seeds'] for a in pre['action_seeds']];roots={};binds={};bindhash={}
@@ -48,13 +48,25 @@ def main():
     for pair in pre['pairs']:
      vr,ar=pair['receiver'];vd,ad=pair['donor'];kind='swap' if scope=='Q5' else 'alt';tr=trace(kind,vr,ar,[vd,ad]);tr['final']['actions_physical']=trace(kind,vd,ad,None)['final']['actions_physical'];tr['meta'].update(receiver_baseline=ref(f'baseline|{oid}|{vr}-{ar}'),donor_baseline=ref(f'baseline|{oid}|{vd}-{ad}'));commit(f'{kind}|{oid}|{vr}-{ar}|{vd}-{ad}',tr)
    assert {r['key'] for r in rows}==keys
-   (directory/'index.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows));put(directory/'RUN_STAMP.json',{'prereg_sha256':H.PREREG,'mode':'run','runtime_binding_sha256':bindhash[scope],'split':'holdout','holdout_refs':refs})
+   (directory/'index.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows));
+   if scope=='Q5':(directory/'source_checks.jsonl').write_text(''.join(json.dumps({'obs_id':o['obs_id'],'source_trace_sha256':o['trace_sha256'],'runtime_binding_sha256':bindhash[scope],'result':'steps_and_final_bitwise_equal'})+'\n' for o in obs))
+   put(directory/'RUN_STAMP.json',{'prereg_sha256':H.PREREG,'mode':'run','runtime_binding_sha256':bindhash[scope],'split':'holdout','holdout_refs':refs})
   output=root/'analysis';cmd=[sys.executable,str(Path(H.__file__).resolve()),'--prereg',str(P),'--freeze',str(F),'--explore-freeze',str(E),'--holdout-manifest',str(receipt),'--q5',str(roots['Q5']),'--q6',str(roots['Q6']),'--q5-binding',str(binds['Q5']),'--q6-binding',str(binds['Q6']),'--out',str(output)];subprocess.run(cmd,check=True)
   result=json.loads((output/'analysis.json').read_text());assert result['split']=='holdout' and not result['explore_effects_loaded'];assert result['counts']['Q5_effect']==result['counts']['Q6_effect']==864;assert result['counts']['Q6_action_scatter']==432;passed.append('18-observation full synthetic CLI exact groups/counts')
   for x in result['groups']['GT_command_consistency']['tasks'].values():assert x['n_rows']==x['n_observations_with_rows']==0 and x['metrics']['delta_E_m']['mean'] is None and x['metrics']['delta_E_m']['n_eligible_episodes']==0
   passed.append('zero-GT subset gives null, never zero or silently omitted group')
   for x in result['groups']['Q5_direction']['tasks'].values():assert x['metrics']['p']['mean']==1 and x['metrics']['r_perp_m']['mean']==0
   passed.append('fixture donor direction and frozen metric functions preserved')
+  journal=roots['Q5']/'source_checks.jsonl';original=journal.read_text()
+  for kind in ['wrong_result','wrong_source','wrong_binding','incomplete_latest']:
+   data=[json.loads(line) for line in original.splitlines()]
+   if kind=='wrong_result':data[-1]['result']='failed'
+   if kind=='wrong_source':data[-1]['source_trace_sha256']='0'*64
+   if kind=='wrong_binding':data[-1]['runtime_binding_sha256']='0'*64
+   if kind=='incomplete_latest':data+=data[:4]
+   journal.write_text(''.join(json.dumps(d)+'\n' for d in data));badcmd=cmd.copy();badcmd[-1]=str(root/kind);rc=subprocess.run(badcmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);assert rc.returncode and not (root/kind).exists();passed.append(kind+' source journal rejected before output')
+  journal.write_text('');badcmd=[cmd[0],'-O']+cmd[1:];badcmd[-1]=str(root/'optimized_failure');rc=subprocess.run(badcmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);assert rc.returncode and not (root/'optimized_failure').exists();passed.append('python -O retains source-check protection')
+  journal.write_text(original)
   # Orphan rejection must happen before a fresh result directory exists.
   (roots['Q5']/'orphan.pt').write_bytes(b'x');cmd[-1]=str(root/'rejected_out');r=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);assert r.returncode and not (root/'rejected_out').exists();passed.append('orphan unit rejected before analysis output')
  report={'format':'codex-holdout-analysis-fixture/1','passed':passed,'no_real_effects_loaded':True,'adapter_sha256':H.F.sha(H.__file__),'fixture_script_sha256':H.F.sha(__file__),'frozen_metric_sha256':H.ANALYSIS}
