@@ -59,7 +59,7 @@ def hierarchy(rows,metrics,observations):
     sampled=np.random.default_rng(20261018).integers(0,len(vals),size=(10000,len(vals)));ci=np.quantile(vals[sampled].mean(1),[.025,.975],method='linear');mean=float(vals.mean());ci=ci.tolist()
    else:mean=None;ci=[None,None]
    aggregate[m]={'mean':mean,'ci95':ci,'n_eligible_episodes':len(vals),'n_total_episodes':len(eps),'empty_episodes':[e for e in eps if epout[str(e)][m]['mean'] is None]}
-  tasks[task]={'n_rows':sum(len(by[o['obs_id']]) for o in oo),'n_observations_with_rows':sum(o['obs_id'] in by for o in oo),'episode':epout,'metrics':aggregate}
+  tasks[task]={'n_rows':sum(len(by.get(o['obs_id'],[])) for o in oo),'n_observations_with_rows':sum(o['obs_id'] in by for o in oo),'episode':epout,'metrics':aggregate}
  return {'observations':obsout,'tasks':tasks}
 def main():
  ap=argparse.ArgumentParser();ap.add_argument('--repo',default='/home/dongyicheng/OpenWAM');ap.add_argument('--out',required=True);args=ap.parse_args();repo=Path(args.repo);out=Path(args.out);assert not out.exists();out.mkdir(parents=True)

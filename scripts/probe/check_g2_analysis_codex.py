@@ -17,7 +17,7 @@ class Tests(unittest.TestCase):
  def test_hierarchy_unequal_rows_and_empty_episode(self):
   obs=[{'obs_id':'a','episode':0,'task':'t'},{'obs_id':'b','episode':0,'task':'t'},{'obs_id':'c','episode':1,'task':'t'},{'obs_id':'d','episode':2,'task':'t'}]
   rows=[{'obs_id':'a','metrics':{'x':0}}]*10+[{'obs_id':'b','metrics':{'x':2}},{'obs_id':'c','metrics':{'x':9}}]
-  s=hierarchy(rows,['x'],obs)['tasks']['t']['metrics']['x'];self.assertEqual(s['mean'],5);self.assertEqual(s['empty_episodes'],[2]);self.assertEqual(s['n_eligible_episodes'],2);self.assertEqual(s['ci95'],[1,9])
+  task=hierarchy(rows,['x'],obs)['tasks']['t'];self.assertEqual(task['n_observations_with_rows'],3);s=task['metrics']['x'];self.assertEqual(s['mean'],5);self.assertEqual(s['empty_episodes'],[2]);self.assertEqual(s['n_eligible_episodes'],2);self.assertEqual(s['ci95'],[1,9])
  def test_degenerate_rotations_explicit(self):
   z=np.zeros((32,20));m=physical(z,z);self.assertEqual(m['rotation_invalid_A'],64);self.assertEqual(m['rotation_valid_comparisons'],0);self.assertIsNone(m['rotation_mean_deg']);self.assertEqual(m['D_xyz_m'],0)
  def test_nonfinite_actions_rejected(self):
