@@ -36,6 +36,7 @@ def main():
     for n,h in candidate['source']['code_sha256'].items():
         bindings[n]=sha256_file(repo/n);assert bindings[n]==h
     config=repo/candidate['deploy_config']['path'];assert sha256_file(config)==candidate['deploy_config']['sha256']
+    save(out/'validated_bindings.json',dict(bindings=bindings,candidate_sha256=sha256_file(args.candidate)))
     refs=json.loads((repo/candidate['selfcheck']['summary']).read_text())
     assert sha256_file(repo/candidate['selfcheck']['summary'])==candidate['selfcheck']['sha256']
     byref={r['obs_id']:r for r in refs['results']};byid={r['obs_id']:r for r in pr['observations']}
@@ -91,14 +92,17 @@ def main():
         pixels=(raw*(2/255)-1).permute(3,0,1,2).unsqueeze(0)
         pathpixels=E.preprocess_video(frames,encoder=vb.video_encoder,dtype=runner.arch.dtype,device=runner.arch.device)
         checks['pixel_range_scaling_dtype_exact']=eq(pixels,pathpixels)
-        gt=vb.video_encoder.batch_encode(pixels).to(runner.arch.dtype).cpu()
+        # Deployment may resolve the config to the native Wan VAE, without an encoder adapter.
+        gt=(vb.video_encoder.batch_encode(pixels) if vb.video_encoder is not None
+            else vb.vae.batch_encode(pixels,device=pixels.device)).to(runner.arch.dtype).cpu()
         checks['gt_encoding_helper_exact']=eq(gt,runner.encode_frames(helper).cpu())
         checks['gt_first_latent_exact']=eq(gt[:,:,:nf],first)
         checks['gt_latent_contract']=gt.shape==own.shape and gt.dtype==own.dtype
         rgt=generate(cond_future_override=gt)
         checks['gt_override_firstframe']=eq(rgt['final']['cond_video_latents_used'][:,:,:nf],first)
         checks['gt_override_future']=eq(rgt['final']['cond_video_latents_used'][:,:,nf:],gt[:,:,nf:])
-        decoded=vb.video_encoder.decode(gt.to(runner.arch.device),tiled=True)
+        decoded=(vb.video_encoder.decode(gt.to(runner.arch.device),tiled=True) if vb.video_encoder is not None
+                 else vb.vae.decode(gt.to(runner.arch.device),device=runner.arch.device,tiled=True))
         checks['gt_reconstruction_finite9frames']=bool(torch.isfinite(decoded).all()) and tuple(decoded.shape)==(1,3,9,384,320)
         st=stats.get('eef_state',stats['eef']);mn=np.asarray(st['min'],np.float32);mx=np.asarray(st['max'],np.float32)
         expected=np.clip((np.asarray(rec['proprio'],np.float32)-mn)/np.maximum(mx-mn,1e-6)*2-1,-1,1)
@@ -117,6 +121,7 @@ def main():
                  all_passed=all(all(x['checks'].values()) for x in report),results=report,bindings=bindings,
                  prereg_sha256=sha256_file(args.prereg),candidate_sha256=sha256_file(args.candidate),
                  own_script_sha256=sha256_file(__file__),seconds=time.time()-start,
+                 resolved_video_encoder='native Wan VAE' if vb.video_encoder is None else type(vb.video_encoder).__name__,
                  runtime_head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip())
     save(out/'summary.json',summary);print(json.dumps({'all_passed':summary['all_passed'],'seconds':summary['seconds']}),flush=True)
 
