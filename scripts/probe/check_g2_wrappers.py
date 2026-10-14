@@ -85,6 +85,8 @@ class FakeRunner:
         return lat
 
     def rerun(self, src, *, video_seed=None, action_seed=None, replay=None, record=True, cond_future_override=None):
+        if replay is not None:  # the real runner reads these from the replayed trace
+            _ = [replay["meta"][k] for k in ("schedule", "num_frames", "action_num_frames")]
         v, a = int(video_seed), int(action_seed)
         fut = tensor(v, (1, 2, 3))
         fut[:, :, :1] = tensor(7, (1, 2, 1))
@@ -209,7 +211,8 @@ class Q5Checks(Base):
             for a in (2001,):
                 pt = FakeRunner().rerun(None, video_seed=v, action_seed=a)["probe_trace"]
                 tr = {"meta": {"prereg_sha256": "g1" * 32, "source_trace_sha256": C.sha256_file(src),
-                               "video_seed": v, "action_seed": a}, "steps": pt["steps"], "final": pt["final"]}
+                               "video_seed": v, "action_seed": a, "schedule": FAKE_DESC["schedule"],
+                               "num_frames": 9, "action_num_frames": 33}, "steps": pt["steps"], "final": pt["final"]}
                 p = root / "t" / "o1" / "grid" / f"v{v}_a{a}.pt"
                 p.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(tr, p)
@@ -231,13 +234,13 @@ class Q5Checks(Base):
     def test_identity_failure_and_forged_unit(self):
         class Bad(FakeRunner):
             def rerun(self, *a, **k):
-                r = super().rerun(*a, **{x: y for x, y in k.items() if x != "replay"})
+                r = super().rerun(*a, **k)
                 r["probe_trace"]["final"]["actions_physical"] = r["probe_trace"]["final"]["actions_physical"] + 1
                 return r
 
         class Good(FakeRunner):
             def rerun(self, *a, **k):
-                return super().rerun(*a, **{x: y for x, y in k.items() if x != "replay"})
+                return super().rerun(*a, **k)
 
         with self.assertRaises(SystemExit):
             self.q5(Bad()).run()
@@ -343,7 +346,8 @@ class HoldoutChecks(Base):
         src = self.tmp / "src.pt"
         pt = FakeRunner().rerun(None, video_seed=1001, action_seed=2001)["probe_trace"]
         self.src_actions = pt["final"]["actions_physical"]
-        torch.save({"meta": {"format": "openwam-g0-probe-trace/1", "video_seed": 1001, "action_seed": 2001},
+        torch.save({"meta": {"format": "openwam-g0-probe-trace/1", "video_seed": 1001, "action_seed": 2001,
+                             "num_frames": 9, "action_num_frames": 33, "denoise_steps": 1, "seed": 42},
                     "cond": {"prompt": "p"}, "final": {"actions_physical": self.src_actions}}, src)
         rec = self.write("record.json", {"prompt": "p", "proprio": [0.5] * 20, "pngs": {}, "post_obs": []})
         self.obs = [{"obs_id": "h1", "task": "t", "episode": 0, "split": "holdout", "trace": str(src),
@@ -392,7 +396,7 @@ class HoldoutChecks(Base):
     def test_q5_holdout_makes_baselines_then_identity(self):
         class Good(FakeRunner):
             def rerun(self, *a, **k):
-                return super().rerun(*a, **{x: y for x, y in k.items() if x != "replay"})
+                return super().rerun(*a, **k)
 
         q = self.q5(Good())
         q.run()
@@ -405,7 +409,7 @@ class HoldoutChecks(Base):
     def test_q5_holdout_online_source_mismatch_not_indexed(self):
         class Off(FakeRunner):
             def rerun(self, *a, **k):
-                r = super().rerun(*a, **{x: y for x, y in k.items() if x != "replay"})
+                r = super().rerun(*a, **k)
                 r["probe_trace"]["final"]["actions_physical"] = r["probe_trace"]["final"]["actions_physical"] + 1
                 return r
 

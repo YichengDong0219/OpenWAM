@@ -177,6 +177,8 @@ class Q5:
                     if self.mode == "run" and [list(map(float, s)) for s in pt["schedule"]] != self.runtime["schedule"]:
                         raise SystemExit(f"generation schedule differs from the bound runtime for {key}")
                     tr = {"meta": {**expect, "schedule": pt["schedule"], "active_action_mask": pt["active_action_mask"],
+                                   # what a replay of this baseline reads (as in G1 grid traces)
+                                   **{k: sm[k] for k in ("num_frames", "action_num_frames", "denoise_steps", "seed")},
                                    "runtime_code": self.runtime_code,
                                    "runtime_engine_config_sha256": self.runtime["engine_config_sha256"],
                                    "receipts": self.receipts, "role": "baseline"},
