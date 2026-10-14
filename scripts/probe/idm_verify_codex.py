@@ -53,10 +53,12 @@ def main():
         a=generate();b=generate(action_seed=v['stage1_independence_action_seeds'][1]);d=generate(video_seed=v['donor'][0])
         own=a['final']['stage1_future_latents'];first=a['cond']['first_frame_latents'];nf=first.shape[2]
         switched=generate(cond_future_override=d['final']['stage1_future_latents']);identity=generate(cond_future_override=own)
+        repeated=generate()
         checks={
             'cross_gpu_actions_bitexact':eq(a['final']['actions_physical'],trace['final']['actions_physical']),
             'cross_gpu_stage2_bitexact':steps(a['steps'],trace['steps'],('t_a','action_latents_in','action_velocity')),
-            'cross_gpu_stage1_bitexact':steps(a['stage1_steps'],trace['stage1_steps'],('t_v','video_latents_in','video_velocity')),
+            'gpu3_repeat_stage1_bitexact':steps(a['stage1_steps'],repeated['stage1_steps'],('t_v','video_latents_in','video_velocity')),
+            'gpu3_repeat_actions_bitexact':eq(a['final']['actions_physical'],repeated['final']['actions_physical']),
             'action_noise_changes':not eq(a['init']['action_noise'],b['init']['action_noise']),
             'stage1_action_seed_independent':steps(a['stage1_steps'],b['stage1_steps'],('t_v','video_latents_in','video_velocity')) and eq(own,b['final']['stage1_future_latents']),
             'donor_video_distinct':not eq(own,d['final']['stage1_future_latents']),
