@@ -160,7 +160,8 @@ def loaded_repo_files() -> list:
     out = set()
     for m in list(sys.modules.values()):
         f = getattr(m, "__file__", None)
-        if f and str(Path(f).resolve()).startswith(str(REPO) + os.sep) and f.endswith(".py"):
+        # some extension modules carry a bare relative __file__ (torch._classes -> "_classes.py")
+        if f and os.path.isabs(f) and str(Path(f).resolve()).startswith(str(REPO) + os.sep) and f.endswith(".py"):
             out.add(os.path.relpath(Path(f).resolve(), REPO))
     return sorted(out)
 
