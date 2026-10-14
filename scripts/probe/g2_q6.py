@@ -1,26 +1,30 @@
 """G2 K8: IDM clean-future injection (Q6) and GT-future command consistency on the G2 observations.
 
 Per observation (inputs rebuilt from the G0 record, not from alpha's trace):
-  source    one engine.generate (v1001, a2001) with a probe trace -> meta/cond for every rerun
-  baseline  16 full IDM generations (4 video x 4 action seeds); stage-1 futures must be identical
-            across action seeds at each video seed (the verified stage1_reuse condition)
+  source    one engine.generate (v1001, a2001) with a probe trace -> meta/cond for every rerun;
+            indexed only after its seeds, prompt, conditioning image, proprio and config hash check
+  baseline  16 full IDM generations (4 video x 4 action seeds); (1001, 2001) must equal the engine
+            source; stage-1 steps and future identical across action seeds at each video seed
   identity  16 reruns with cond_future_override = own stage-1 future; must reproduce the baseline
-            actions, stage-2 steps and clean condition bit for bit
+            stage-2 steps, actions and clean condition bit for bit BEFORE being indexed
   alt       48 primary pairs: receiver (vr, ar) with the donor baseline's (vd, ad) stage-1 future
   gt        GT-eligible observations only: 16 receivers with the executed future (record PNGs at
-            offsets 0,4..32 -> server canvas -> IDM VAE), PNG hashes bound to the prereg
-Every override run must leave the receiver's own stage-1 future unchanged. Writes traces + index
-only; no Q6 effect metric is computed here (A3 reads the traces).
+            offsets 0,4..32 -> server canvas -> IDM VAE), PNG set bound exactly to the prereg
+Every override run must leave the receiver's own stage-1 future unchanged. Failures go to
+failures.jsonl and are never indexed; resumed units are re-checked (identity, references, and for
+identity/gt_future the bitwise conditions again). Protections as in g2_q5 (g2_common).
+No Q6 effect metric is computed here; A3 reads the traces.
 
-    run   : formal; needs the G2 freeze receipt, a jointly bound IDM runtime binding and a clean tree
-    smoke : source + baseline + identity (+ GT future construction) on the first N observations; no alt/gt runs
+    describe : load the model and write the runtime description to --out (for the manifest)
+    smoke    : source + baseline + identity (+ GT future construction) on the first N observations
+    run      : formal
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -31,49 +35,56 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts" / "probe"))
 
-from g2_q5 import append_jsonl, atomic_torch_save, same  # noqa: E402
-from offline_runner import OfflineRunner, sha256_file  # noqa: E402
+from g2_common import (Ledger, check_binding, check_imports_bound, check_meta, check_runtime,  # noqa: E402
+                       describe_runtime, same, sha256_file, write_description)
 
 IDM_CKPT = REPO / "assets/openwam_ckpt/openwam_study/robotwin_dual_system_idm"
+DEFAULT_CONFIG = REPO / "configs/deploy_probe.yaml"
 STAGE2_KEYS = ("t_a", "action_latents_in", "action_velocity")
+STAGE1_KEYS = ("t_v", "video_latents_in", "video_velocity")
 FINAL_KEYS = ("action_latents", "actions_normalized", "actions_physical", "cond_video_latents_used")
 SOURCE_SEEDS = (1001, 2001)
+FORMAT = "openwam-g2-q6/2"
 
 
-def override_mismatches(base: dict, pt: dict) -> list:
-    if len(base["steps"]) != len(pt["steps"]):
+def override_mismatches(base: dict, tr: dict) -> list:
+    if len(base["steps"]) != len(tr["steps"]):
         return ["n_steps"]
-    bad = [f"step{s['i']}.{k}" for s, t in zip(base["steps"], pt["steps"]) for k in STAGE2_KEYS if not same(s[k], t[k])]
-    return bad + [f"final.{k}" for k in FINAL_KEYS if not same(base["final"][k], pt["final"][k])]
+    bad = [f"step{s['i']}.{k}" for s, t in zip(base["steps"], tr["steps"]) for k in STAGE2_KEYS
+           if k not in t or not same(s[k], t[k])]
+    return bad + [f"final.{k}" for k in FINAL_KEYS if not same(base["final"][k], tr["final"][k])]
+
+
+def array_sha(arr) -> str:
+    return hashlib.sha256(np.ascontiguousarray(np.asarray(arr)).tobytes()).hexdigest()
+
+
+def make_runner(ckpt, config):
+    from offline_runner import OfflineRunner
+
+    return OfflineRunner(str(ckpt), str(config))
 
 
 class Q6:
-    def __init__(self, args, mode: str):
+    def __init__(self, args, mode: str, runner_factory=make_runner):
         self.mode = mode
         self.prereg_path = Path(args.prereg).resolve()
         self.prereg = json.loads(self.prereg_path.read_text())
         self.prereg_sha = sha256_file(self.prereg_path)
         if self.prereg.get("format") != "openwam-g2-prereg/1":
             raise SystemExit("not a G2 prereg")
-        self.receipts = self._receipts(args) if mode == "run" else {}
+        self.config = Path(args.config or DEFAULT_CONFIG).resolve()
+        self.receipts, self.manifest = {}, None
+        if mode == "run":
+            rec = json.loads(Path(args.freeze_receipt).read_text())
+            if rec.get("status") != "frozen" or rec.get("prereg_sha256") != self.prereg_sha:
+                raise SystemExit("G2 freeze receipt does not freeze this prereg")
+            bound = check_binding(args.runtime_binding, self.prereg_path, "Q6_idm", self.config, IDM_CKPT)
+            self.manifest = bound.pop("manifest")
+            self.receipts = {"freeze_receipt": {"path": str(Path(args.freeze_receipt).resolve()),
+                                                "sha256": sha256_file(args.freeze_receipt)}, **bound}
+        self.binding_sha = self.receipts.get("runtime_binding", {}).get("sha256")
         self.gt_ids = set(self.prereg["gt_eligibility"]["eligible_explore_obs_ids"])
-        self.out = Path(args.out).resolve()
-        root = (REPO / "outputs" / "probe").resolve()
-        if not str(self.out).startswith(str(root) + os.sep):
-            raise SystemExit(f"--out must be below {root}")
-        stamp = self.out / "RUN_STAMP.json"
-        want_stamp = {"prereg_sha256": self.prereg_sha, "mode": mode,
-                      "runtime_binding_sha256": self.receipts.get("runtime_binding", {}).get("sha256")}
-        if stamp.exists() and json.loads(stamp.read_text()) != want_stamp:
-            raise SystemExit("output dir belongs to a different prereg/mode/binding; refusing to mix runs")
-        self.out.mkdir(parents=True, exist_ok=True)
-        stamp.write_text(json.dumps(want_stamp, sort_keys=True))
-        self.index = self.out / "index.jsonl"
-        self.done = {}
-        if self.index.exists():
-            for line in self.index.read_text().splitlines():
-                row = json.loads(line)
-                self.done[row["path"]] = row["sha256"]
         obs = self.prereg["observations"]
         self.observations = obs[: args.n_obs] if mode == "smoke" else obs
         self.records = {}
@@ -81,140 +92,165 @@ class Q6:
             if sha256_file(o["record"]) != o["record_sha256"]:
                 raise SystemExit(f"record sha mismatch for {o['obs_id']}")
             self.records[o["obs_id"]] = json.loads(Path(o["record"]).read_text())
-        self.runner = OfflineRunner(str(IDM_CKPT), args.config)
-        if type(self.runner.arch).__name__.lower().find("idm") < 0:
+        self.ledger = Ledger(args.out, {"prereg_sha256": self.prereg_sha, "mode": mode, "runtime_binding_sha256": self.binding_sha})
+        self.runner = runner_factory(IDM_CKPT, self.config)
+        if "idm" not in type(self.runner.arch).__name__.lower():
             raise SystemExit(f"checkpoint is not an IDM architecture: {type(self.runner.arch).__name__}")
-        from openwam.deploy.engine import _cfg_sha256, _code_version
+        self.runtime = check_runtime(self.runner, self.manifest) if mode == "run" else describe_runtime(self.runner)
+        from openwam.deploy.engine import _code_version
 
         self.runtime_code = dict(_code_version())
-        self.runtime_config_sha256 = _cfg_sha256(self.runner.engine.cfg)
         if mode == "run" and (self.runtime_code.get("dirty") or not self.runtime_code.get("commit")):
             raise SystemExit(f"formal run needs a clean committed tree; got {self.runtime_code}")
         info = self.runner.precompute_prompts([r["prompt"] for r in self.records.values()])
         print(f"[init] {mode}: {len(self.observations)} obs; prompts {info}; code {self.runtime_code}", flush=True)
 
-    def _receipts(self, args) -> dict:
-        rec = json.loads(Path(args.freeze_receipt).read_text())
-        if rec.get("status") != "frozen" or rec.get("prereg_sha256") != self.prereg_sha:
-            raise SystemExit("G2 freeze receipt does not freeze this prereg")
-        bind_path = Path(args.runtime_binding)
-        bind = json.loads(bind_path.read_text())
-        if bind.get("status") != "jointly_bound" or bind.get("scope") != "Q6_idm":
-            raise SystemExit("IDM runtime binding is not jointly bound for Q6")
-        if not all(isinstance((bind.get("signatures") or {}).get(k), str) and bind["signatures"][k].strip()
-                   for k in ("claude", "codex")):
-            raise SystemExit("runtime binding lacks both signatures")
-        man_path = Path(bind["manifest_path"])
-        if sha256_file(man_path) != bind["manifest_sha256"]:
-            raise SystemExit("runtime manifest differs from binding")
-        man = json.loads(man_path.read_text())
-        if man.get("prereg_sha256") != self.prereg_sha:
-            raise SystemExit("runtime manifest names another prereg")
-        for art in man["artifacts"]:
-            if sha256_file(art["path"]) != art["sha256"]:
-                raise SystemExit(f"runtime artifact changed: {art['path']}")
-        print(f"[init] {len(man['artifacts'])} runtime artifacts verified", flush=True)
-        return {"freeze_receipt": {"path": str(Path(args.freeze_receipt).resolve()), "sha256": sha256_file(args.freeze_receipt)},
-                "runtime_binding": {"path": str(bind_path.resolve()), "sha256": sha256_file(bind_path)},
-                "runtime_manifest": {"path": str(man_path), "sha256": bind["manifest_sha256"],
-                                     "commit": man["runtime_commit"]}}
-
-    # -- io --------------------------------------------------------------------------------------
+    # -- helpers ---------------------------------------------------------------------------------
     def odir(self, obs) -> Path:
-        return self.out / obs["task"] / obs["obs_id"]
+        return self.ledger.out / obs["task"] / obs["obs_id"]
 
-    def reuse(self, path: Path) -> bool:
-        return str(path) in self.done and path.exists() and sha256_file(path) == self.done[str(path)]
+    def ref(self, key) -> dict:
+        row = self.ledger.get(key)
+        return {"path": row["path"], "sha256": row["sha256"]}
 
-    def index_row(self, obs, kind, path, sha, **extra) -> None:
-        row = {"path": str(path), "sha256": sha, "kind": kind, "obs_id": obs["obs_id"], "task": obs["task"],
-               "episode": obs["episode"], "prereg_sha256": self.prereg_sha, **extra}
-        append_jsonl(self.index, row)
-        self.done[str(path)] = sha
+    def ident(self, obs, kind, **extra) -> dict:
+        return {"format": FORMAT, "kind": kind, "prereg_sha256": self.prereg_sha, "runtime_binding_sha256": self.binding_sha,
+                "obs_id": obs["obs_id"], "task": obs["task"], "episode": obs["episode"],
+                "record_sha256": obs["record_sha256"], **extra}
 
-    def save(self, obs, kind, path, source, pt, actions, vr, ar, extra, keep_stage1: bool) -> None:
-        tr = {"meta": {"format": "openwam-g2-q6/1", "kind": kind, "prereg_sha256": self.prereg_sha,
-                       "record_sha256": obs["record_sha256"], "source": source, "schedule": pt["schedule"],
-                       "video_seed": vr, "action_seed": ar, "active_action_mask": pt["active_action_mask"],
-                       "runtime_code": self.runtime_code, "runtime_config_sha256": self.runtime_config_sha256,
-                       "receipts": self.receipts, **extra},
+    def check_schedule(self, pt, where) -> None:
+        if self.mode == "run" and [list(map(float, s)) for s in pt["schedule"]] != self.runtime["schedule"]:
+            raise SystemExit(f"generation schedule differs from the bound runtime ({where})")
+
+    def trace(self, expect, pt, actions, keep_stage1) -> dict:
+        tr = {"meta": {**expect, "schedule": pt["schedule"], "active_action_mask": pt["active_action_mask"],
+                       "runtime_code": self.runtime_code, "runtime_engine_config_sha256": self.runtime["engine_config_sha256"],
+                       "receipts": self.receipts},
               "cond": pt["cond"], "init": pt["init"], "steps": pt["steps"],
               "final": {**pt["final"], "actions_returned": np.asarray(actions).copy()}}
         if keep_stage1:
             tr["stage1_steps"] = pt["stage1_steps"]
-        self.index_row(obs, kind, path, atomic_torch_save(tr, path), receiver=[vr, ar], **extra)
+        return tr
 
-    def load(self, path: Path) -> dict:
-        if not self.reuse(path):
-            raise RuntimeError(f"missing or changed output: {path}")
-        return torch.load(path, map_location="cpu", weights_only=False)
+    def commit(self, key, path, tr, obs, kind, receiver, donor) -> None:
+        self.ledger.commit(key, path, tr, kind=kind, obs_id=obs["obs_id"], task=obs["task"], episode=obs["episode"],
+                           receiver=receiver, donor=donor)
 
-    # -- work ------------------------------------------------------------------------------------
-    def source(self, obs) -> tuple[dict, dict]:
+    # -- source ------------------------------------------------------------------------------------
+    def canvas(self, obs) -> dict:
         rec = self.records[obs["obs_id"]]
-        path = self.odir(obs) / "source.pt"
-        if not self.reuse(path):
-            canvas = self.runner.canvas_from_pngs(rec["pngs"], prompt=rec["prompt"], state=rec.get("proprio"))
-            v, a = SOURCE_SEEDS
-            res = self.runner.engine.generate({"first_frame_image": [canvas["image"]], "prompt": canvas["prompt"],
-                                               "proprio": canvas.get("state"),
-                                               "probe": {"trace_path": str(path), "video_seed": v, "action_seed": a}})
-            receipt = res["probe_receipt"]
-            self.index_row(obs, "source", path, receipt["sha256"], receiver=[v, a])
-        tr = self.load(path)
-        return tr, {"path": str(path), "sha256": self.done[str(path)]}
+        return self.runner.canvas_from_pngs(rec["pngs"], prompt=rec["prompt"], state=rec.get("proprio"))
 
-    def baselines(self, obs, src, src_ref) -> dict:
-        out = {}
+    def check_source(self, obs, tr, canvas) -> list:
+        m, rec = tr["meta"], self.records[obs["obs_id"]]
+        bad = [k for k, ok in (
+            ("seeds", (int(m["video_seed"]), int(m["action_seed"])) == SOURCE_SEEDS),
+            ("prompt", tr["cond"]["prompt"] == rec["prompt"]),
+            ("image", same(np.asarray(canvas["image"].convert("RGB"), dtype=np.uint8), tr["cond"]["image"])),
+            ("proprio", same(tr["cond"]["proprio"].reshape(-1),
+                             self.runner.arch.normalize_deploy_proprio(rec.get("proprio")).reshape(-1).to(tr["cond"]["proprio"].dtype))),
+            ("config", m.get("deploy_config_sha256") == self.runtime["engine_config_sha256"]),
+        ) if not ok]
+        if self.mode == "run" and [list(map(float, s)) for s in m["schedule"]] != self.runtime["schedule"]:
+            bad.append("schedule")
+        return bad
+
+    def source(self, obs) -> dict:
+        key, path = f"source|{obs['obs_id']}", self.odir(obs) / "source.pt"
+        canvas = self.canvas(obs)
+        if not self.ledger.get(key):
+            v, a = SOURCE_SEEDS
+            self.runner.engine.generate({"first_frame_image": [canvas["image"]], "prompt": canvas["prompt"],
+                                         "proprio": canvas.get("state"),
+                                         "probe": {"trace_path": str(path), "video_seed": v, "action_seed": a}})
+            tr = torch.load(path, map_location="cpu", weights_only=False)
+            bad = self.check_source(obs, tr, canvas)
+            if bad:
+                self.ledger.fail(key, f"source checks failed: {bad}")
+                raise SystemExit(f"engine source failed its checks for {obs['obs_id']}: {bad}")
+            self.ledger.adopt(key, path, kind="source", obs_id=obs["obs_id"], task=obs["task"], episode=obs["episode"],
+                              receiver=list(SOURCE_SEEDS), donor=None)
+            return tr
+        tr = self.ledger.load(key)
+        bad = self.check_source(obs, tr, canvas)
+        if bad:
+            raise SystemExit(f"stored source no longer passes its checks for {obs['obs_id']}: {bad}")
+        return tr
+
+    # -- baselines -------------------------------------------------------------------------------
+    def baselines(self, obs, src) -> dict:
+        src_ref, out = self.ref(f"source|{obs['obs_id']}"), {}
         for v in self.prereg["video_seeds"]:
             for a in self.prereg["action_seeds"]:
-                path = self.odir(obs) / "baseline" / f"v{v}_a{a}.pt"
-                if not self.reuse(path):
+                key, path = f"baseline|{obs['obs_id']}|{v}-{a}", self.odir(obs) / "baseline" / f"v{v}_a{a}.pt"
+                expect = self.ident(obs, "baseline", video_seed=v, action_seed=a, donor=None, source=src_ref)
+                if self.ledger.get(key):
+                    tr = self.ledger.load(key)
+                    check_meta(tr, expect, key)
+                else:
                     res = self.runner.rerun(src, video_seed=v, action_seed=a)
                     pt = res["probe_trace"]
+                    self.check_schedule(pt, key)
+                    tr = self.trace(expect, pt, res["actions"], keep_stage1=True)
                     if (v, a) == SOURCE_SEEDS and not same(pt["final"]["actions_physical"], src["final"]["actions_physical"]):
-                        raise RuntimeError(f"offline baseline != engine source for {obs['obs_id']}")
-                    self.save(obs, "baseline", path, src_ref, pt, res["actions"], v, a, {"donor": None}, keep_stage1=True)
-                tr = self.load(path)
-                out[(v, a)] = {"trace": tr, "path": str(path), "sha256": self.done[str(path)]}
-            fut = [out[(v, a)]["trace"]["final"]["stage1_future_latents"] for a in self.prereg["action_seeds"]]
-            if not all(same(fut[0], f) for f in fut[1:]):
-                raise RuntimeError(f"stage-1 future depends on the action seed at v{v} for {obs['obs_id']}")
+                        self.ledger.fail(key, "offline baseline != engine source")
+                        raise SystemExit(f"offline baseline != engine source for {obs['obs_id']}")
+                    self.commit(key, path, tr, obs, "baseline", [v, a], None)
+                if (v, a) == SOURCE_SEEDS and not same(tr["final"]["actions_physical"], src["final"]["actions_physical"]):
+                    raise SystemExit(f"stored baseline != engine source for {obs['obs_id']}")
+                out[(v, a)] = {"trace": tr, "ref": self.ref(key)}
+            first = out[(v, self.prereg["action_seeds"][0])]["trace"]
+            for a in self.prereg["action_seeds"][1:]:
+                other = out[(v, a)]["trace"]
+                if not (same(first["final"]["stage1_future_latents"], other["final"]["stage1_future_latents"])
+                        and len(first["stage1_steps"]) == len(other["stage1_steps"])
+                        and all(same(s[k], t[k]) for s, t in zip(first["stage1_steps"], other["stage1_steps"]) for k in STAGE1_KEYS)):
+                    raise SystemExit(f"stage-1 depends on the action seed at v{v} for {obs['obs_id']}")
         return out
 
-    def override(self, obs, src, src_ref, kind, path, base_r, vr, ar, future, extra) -> dict:
+    # -- overrides -------------------------------------------------------------------------------
+    def override_unit(self, obs, src, kind, key, path, base_r, vr, ar, future, donor, extra) -> None:
+        expect = self.ident(obs, kind, video_seed=vr, action_seed=ar, donor=donor,
+                            source=self.ref(f"source|{obs['obs_id']}"), receiver_baseline=base_r["ref"], **extra)
+        if self.ledger.get(key):
+            tr = self.ledger.load(key)
+            check_meta(tr, expect, key)
+            if not same(tr["final"]["stage1_future_latents"], base_r["trace"]["final"]["stage1_future_latents"]):
+                raise SystemExit(f"stored unit changed the receiver stage-1 future: {key}")
+            if kind == "identity" and override_mismatches(base_r["trace"], tr):
+                raise SystemExit(f"stored identity no longer matches its baseline: {key}")
+            return
         res = self.runner.rerun(src, video_seed=vr, action_seed=ar, cond_future_override=future)
         pt = res["probe_trace"]
+        self.check_schedule(pt, key)
+        tr = self.trace(expect, pt, res["actions"], keep_stage1=False)
+        problems = []
         if not same(pt["final"]["stage1_future_latents"], base_r["trace"]["final"]["stage1_future_latents"]):
-            raise RuntimeError(f"receiver stage-1 future changed under override: {path}")
-        self.save(obs, kind, path, src_ref, pt, res["actions"], vr, ar,
-                  {**extra, "receiver_baseline": {"path": base_r["path"], "sha256": base_r["sha256"]}}, keep_stage1=False)
-        return pt
+            problems.append("receiver stage-1 future changed")
+        if kind == "identity":
+            problems += override_mismatches(base_r["trace"], tr)
+        if problems:
+            self.ledger.fail(key, f"{kind} rejected: {problems[:6]}")
+            raise SystemExit(f"{kind} rejected for {key}: {problems[:6]}")
+        self.commit(key, path, tr, obs, kind, [vr, ar], donor)
 
-    def identity(self, obs, src, src_ref, base) -> None:
+    def identity(self, obs, src, base) -> None:
         for (v, a), b in base.items():
-            path = self.odir(obs) / "identity" / f"r{v}-{a}.pt"
-            if self.reuse(path):
-                continue
-            pt = self.override(obs, src, src_ref, "identity", path, b, v, a,
-                               b["trace"]["final"]["stage1_future_latents"], {"donor": [v, a]})
-            bad = override_mismatches(b["trace"], pt)
-            if bad:
-                raise RuntimeError(f"identity override differs from baseline {obs['obs_id']} v{v} a{a}: {bad[:6]}")
+            self.override_unit(obs, src, "identity", f"identity|{obs['obs_id']}|{v}-{a}",
+                               self.odir(obs) / "identity" / f"r{v}-{a}.pt", b, v, a,
+                               b["trace"]["final"]["stage1_future_latents"], [v, a], {})
 
-    def alt(self, obs, src, src_ref, base) -> None:
+    def alt(self, obs, src, base) -> None:
         for pair in self.prereg["pairs"]:
             (vr, ar), (vd, ad) = pair["receiver"], pair["donor"]
-            path = self.odir(obs) / "alt" / f"r{vr}-{ar}_d{vd}-{ad}.pt"
-            if self.reuse(path):
-                continue
             d = base[(vd, ad)]
-            self.override(obs, src, src_ref, "alt", path, base[(vr, ar)], vr, ar,
-                          d["trace"]["final"]["stage1_future_latents"],
-                          {"donor": [vd, ad], "role": pair["pair_kind"],
-                           "donor_baseline": {"path": d["path"], "sha256": d["sha256"]}})
+            self.override_unit(obs, src, "alt", f"alt|{obs['obs_id']}|{vr}-{ar}|{vd}-{ad}",
+                               self.odir(obs) / "alt" / f"r{vr}-{ar}_d{vd}-{ad}.pt", base[(vr, ar)], vr, ar,
+                               d["trace"]["final"]["stage1_future_latents"], [vd, ad],
+                               {"donor_baseline": d["ref"], "role": pair["pair_kind"]})
 
-    def gt_future(self, obs, src) -> tuple[torch.Tensor, dict]:
+    # -- GT --------------------------------------------------------------------------------------
+    def check_gt_pngs(self, obs) -> None:
         rec = self.records[obs["obs_id"]]
         used = {(p["path"], p["sha256"]) for p in rec["pngs"].values()}
         for post in rec["post_obs"]:
@@ -222,72 +258,92 @@ class Q6:
                 used |= {(p["path"], p["sha256"]) for p in post["pngs"].values()}
         bound = {(p["path"], p["sha256"]) for p in obs["pngs"]}
         if len(bound) != 27 or used != bound:
-            raise RuntimeError(f"GT PNGs (offset 0,4..32 x 3 cameras) disagree with the prereg for {obs['obs_id']}")
-        path = self.odir(obs) / "gt_future.pt"
-        if not self.reuse(path):
-            frames = self.runner.gt_future_frames(rec)
-            if not same(np.asarray(frames[0].convert("RGB")), src["cond"]["image"]):
-                raise RuntimeError(f"GT frame 0 canvas != source conditioning image for {obs['obs_id']}")
-            lat = self.runner.encode_frames(frames).cpu()
-            ffl = src["cond"]["first_frame_latents"]
-            if not same(lat[:, :, : ffl.shape[2]], ffl.to(lat.dtype)):
-                raise RuntimeError(f"GT first latent != receiver first-frame latent for {obs['obs_id']}")
-            canv = [hashlib_sha(np.asarray(f.convert("RGB"))) for f in frames]
-            sha = atomic_torch_save({"latents": lat, "canvas_sha256": canv, "record_sha256": obs["record_sha256"]}, path)
-            self.index_row(obs, "gt_future", path, sha)
-        return self.load(path)["latents"], {"path": str(path), "sha256": self.done[str(path)]}
+            raise SystemExit(f"GT PNGs (offset 0,4..32 x 3 cameras) disagree with the prereg for {obs['obs_id']}")
 
-    def gt(self, obs, src, src_ref, base) -> None:
+    def gt_future(self, obs, src) -> tuple[torch.Tensor, dict]:
+        key, path = f"gt_future|{obs['obs_id']}", self.odir(obs) / "gt_future.pt"
+        expect = self.ident(obs, "gt_future", source=self.ref(f"source|{obs['obs_id']}"))
+        ffl = src["cond"]["first_frame_latents"]
+        if self.ledger.get(key):
+            g = self.ledger.load(key)
+            check_meta(g, expect, key)
+        else:
+            self.check_gt_pngs(obs)
+            frames = self.runner.gt_future_frames(self.records[obs["obs_id"]])
+            if not same(np.asarray(frames[0].convert("RGB"), dtype=np.uint8), src["cond"]["image"]):
+                self.ledger.fail(key, "frame0 canvas != source image")
+                raise SystemExit(f"GT frame 0 canvas != source image for {obs['obs_id']}")
+            lat = self.runner.encode_frames(frames).cpu()
+            if not same(lat[:, :, : ffl.shape[2]], ffl.to(lat.dtype)):
+                self.ledger.fail(key, "GT first latent != receiver first-frame latent")
+                raise SystemExit(f"GT first latent != receiver first-frame latent for {obs['obs_id']}")
+            g = {"meta": {**expect, "canvas_sha256": [array_sha(f.convert("RGB")) for f in frames]}, "latents": lat}
+            self.ledger.commit(key, path, g, kind="gt_future", obs_id=obs["obs_id"], task=obs["task"],
+                               episode=obs["episode"], receiver=None, donor=None)
+        if not same(g["latents"][:, :, : ffl.shape[2]], ffl.to(g["latents"].dtype)):
+            raise SystemExit(f"stored GT first latent != receiver first-frame latent for {obs['obs_id']}")
+        return g["latents"], self.ref(key)
+
+    def gt(self, obs, src, base) -> None:
         lat, ref = self.gt_future(obs, src)
         for (v, a), b in base.items():
-            path = self.odir(obs) / "gt" / f"r{v}-{a}.pt"
-            if self.reuse(path):
-                continue
-            self.override(obs, src, src_ref, "gt", path, b, v, a, lat, {"donor": "gt", "gt_future": ref})
+            self.override_unit(obs, src, "gt", f"gt|{obs['obs_id']}|{v}-{a}", self.odir(obs) / "gt" / f"r{v}-{a}.pt",
+                               b, v, a, lat, "gt", {"gt_future": ref})
+
+    # -- driver ----------------------------------------------------------------------------------
+    def expected_keys(self) -> list:
+        keys = []
+        for obs in self.observations:
+            o = obs["obs_id"]
+            keys.append(f"source|{o}")
+            for v in self.prereg["video_seeds"]:
+                for a in self.prereg["action_seeds"]:
+                    keys += [f"baseline|{o}|{v}-{a}", f"identity|{o}|{v}-{a}"]
+                    if self.mode == "run" and o in self.gt_ids:
+                        keys.append(f"gt|{o}|{v}-{a}")
+            if o in self.gt_ids:
+                keys.append(f"gt_future|{o}")
+            if self.mode == "run":
+                keys += [f"alt|{o}|{p['receiver'][0]}-{p['receiver'][1]}|{p['donor'][0]}-{p['donor'][1]}"
+                         for p in self.prereg["pairs"]]
+        return keys
 
     def run(self) -> None:
         for obs in self.observations:
-            src, src_ref = self.source(obs)
-            base = self.baselines(obs, src, src_ref)
-            self.identity(obs, src, src_ref, base)
+            src = self.source(obs)
+            base = self.baselines(obs, src)
+            self.identity(obs, src, base)
             if self.mode == "run":
-                self.alt(obs, src, src_ref, base)
+                self.alt(obs, src, base)
                 if obs["obs_id"] in self.gt_ids:
-                    self.gt(obs, src, src_ref, base)
+                    self.gt(obs, src, base)
             elif obs["obs_id"] in self.gt_ids:
                 self.gt_future(obs, src)  # smoke: build and check the GT future, no override run
             print(f"[{self.mode}] {obs['obs_id']} done", flush=True)
-        kinds = {}
-        for line in self.index.read_text().splitlines():
-            k = json.loads(line)["kind"]
-            kinds[k] = kinds.get(k, 0) + 1
-        n = len(self.observations)
-        n_gt = sum(o["obs_id"] in self.gt_ids for o in self.observations)
-        want = {"source": n, "baseline": 16 * n, "identity": 16 * n, "gt_future": n_gt}
+        keys = self.expected_keys()
+        self.ledger.require_exact(keys)
         if self.mode == "run":
-            want.update(alt=len(self.prereg["pairs"]) * n, gt=16 * n_gt)
-        want = {k: v for k, v in want.items() if v}
-        if kinds != want:
-            raise SystemExit(f"index counts {kinds} != expected {want}")
-        print(f"[{self.mode}] complete: {kinds}", flush=True)
-
-
-def hashlib_sha(arr: np.ndarray) -> str:
-    import hashlib
-
-    return hashlib.sha256(np.ascontiguousarray(arr).tobytes()).hexdigest()
+            check_imports_bound(self.manifest)
+        print(f"[{self.mode}] complete: {len(keys)} units", flush=True)
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["run", "smoke"])
-    p.add_argument("--prereg", required=True)
-    p.add_argument("--out", required=True)
+    p.add_argument("mode", choices=["run", "smoke", "describe"])
+    p.add_argument("--prereg")
+    p.add_argument("--out")
     p.add_argument("--freeze-receipt")
     p.add_argument("--runtime-binding")
     p.add_argument("--config", default=None)
     p.add_argument("--n-obs", type=int, default=1, help="smoke only: first N observations")
     args = p.parse_args(argv)
+    if args.mode == "describe":
+        if not args.out:
+            raise SystemExit("describe needs --out (a new .json file)")
+        write_description(make_runner(IDM_CKPT, Path(args.config or DEFAULT_CONFIG).resolve()), args.out)
+        return
+    if not (args.prereg and args.out):
+        raise SystemExit("--prereg and --out are required")
     if args.mode == "run" and not (args.freeze_receipt and args.runtime_binding):
         raise SystemExit("run needs --freeze-receipt and --runtime-binding")
     Q6(args, args.mode).run()

@@ -6,24 +6,27 @@ evolve under the receiver's own action noise, prompt, proprio and first frame. B
 G1 grid generations (``<g1 root>/<task>/<obs>/grid/v{V}_a{A}.pt``), reused only after the G1 index
 sha, the per-file indexed sha, the G1 prereg sha, the source trace sha and the seeds all match.
 
-Before any swap of an observation, all 16 receivers are replayed against THEMSELVES (identity)
-and must reproduce the baseline actions and every recorded step tensor bit for bit; otherwise the
-run stops (the current runtime would not be the one that made the baselines).
+Before any swap of an observation, all 16 receivers are replayed against THEMSELVES (identity) and
+must reproduce the baseline actions and every recorded step tensor bit for bit; a failing identity
+is recorded in failures.jsonl, never indexed, and stops the run. Resumed units are re-checked:
+stored identity (prereg, binding, observation, seeds, baseline references) and, for identity
+units, the bitwise comparison with the baseline again.
 
-This script writes traces and an index only. It computes no Q5 effect metric; the analysis (A3)
-reads the traces.
+Protections (g2_common): in ``run`` mode the binding, manifest, every artifact, the selected deploy
+config/checkpoint and the resolved config are verified before the output dir is touched or the model
+loaded; after loading, the live runtime must equal the bound description before any generation.
 
-    run   : formal; needs the G2 freeze receipt, a jointly bound alpha runtime binding and a clean tree
-    smoke : identity replays only on the first N observations (no swap, no binding needed)
+No Q5 effect metric is computed here; the analysis (A3) reads the traces.
+
+    describe : load the model and write the runtime description to --out (for the manifest)
+    smoke    : identity replays only on the first N observations (no swap, no binding)
+    run      : formal
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -34,126 +37,70 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts" / "probe"))
 
-from offline_runner import OfflineRunner, load_trace, sha256_file  # noqa: E402
+from g2_common import (Ledger, check_binding, check_imports_bound, check_meta, check_runtime,  # noqa: E402
+                       describe_runtime, same, sha256_file, write_description)
 
 ALPHA_CKPT = REPO / "assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-RoboTwin-Full"
+DEFAULT_CONFIG = REPO / "configs/deploy_probe.yaml"
 STEP_KEYS = ("t_v", "t_a", "video_latents_in", "action_latents_in", "video_velocity", "action_velocity")
 FINAL_KEYS = ("video_latents", "action_latents", "actions_normalized", "actions_physical")
+FORMAT = "openwam-g2-q5/2"
 
 
-def atomic_torch_save(obj, path: Path) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    with open(tmp, "wb") as f:
-        torch.save(obj, f)
-        f.flush()
-        os.fsync(f.fileno())
-    if path.exists():
-        tmp.unlink()
-        raise FileExistsError(f"refusing to overwrite {path}")
-    os.replace(tmp, path)
-    return sha256_file(path)
-
-
-def append_jsonl(path: Path, row: dict) -> None:
-    with open(path, "a") as f:
-        f.write(json.dumps(row, sort_keys=True) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-
-
-def same(a, b) -> bool:
-    if torch.is_tensor(a) or torch.is_tensor(b):
-        return torch.is_tensor(a) and torch.is_tensor(b) and a.dtype == b.dtype and a.shape == b.shape and torch.equal(a, b)
-    if isinstance(a, (float, int)) or isinstance(b, (float, int)):
-        return float(a) == float(b)
-    a, b = np.asarray(a), np.asarray(b)
-    return a.dtype == b.dtype and a.shape == b.shape and np.array_equal(a, b)
-
-
-def identity_mismatches(base: dict, pt: dict) -> list:
+def identity_mismatches(base: dict, tr: dict) -> list:
     """Names of every recorded tensor where a self-replay differs from its baseline (empty = bitwise)."""
-    bad = []
-    if len(base["steps"]) != len(pt["steps"]):
+    if len(base["steps"]) != len(tr["steps"]):
         return ["n_steps"]
-    for s, t in zip(base["steps"], pt["steps"]):
-        bad += [f"step{s['i']}.{k}" for k in STEP_KEYS if k in s and not same(s[k], t[k])]
-    bad += [f"final.{k}" for k in FINAL_KEYS if not same(base["final"][k], pt["final"][k])]
-    return bad
+    bad = []
+    for s, t in zip(base["steps"], tr["steps"]):
+        bad += [f"step{s['i']}.{k}" for k in STEP_KEYS if k in s and (k not in t or not same(s[k], t[k]))]
+    return bad + [f"final.{k}" for k in FINAL_KEYS if not same(base["final"][k], tr["final"][k])]
+
+
+def make_runner(ckpt, config):
+    from offline_runner import OfflineRunner
+
+    return OfflineRunner(str(ckpt), str(config))
 
 
 class Q5:
-    def __init__(self, args, mode: str):
+    def __init__(self, args, mode: str, runner_factory=make_runner):
         self.mode = mode
         self.prereg_path = Path(args.prereg).resolve()
         self.prereg = json.loads(self.prereg_path.read_text())
         self.prereg_sha = sha256_file(self.prereg_path)
         if self.prereg.get("format") != "openwam-g2-prereg/1":
             raise SystemExit("not a G2 prereg")
-        self.receipts = self._receipts(args) if mode == "run" else {}
+        self.config = Path(args.config or DEFAULT_CONFIG).resolve()
+        self.receipts, manifest = {}, None
+        if mode == "run":
+            rec = json.loads(Path(args.freeze_receipt).read_text())
+            if rec.get("status") != "frozen" or rec.get("prereg_sha256") != self.prereg_sha:
+                raise SystemExit("G2 freeze receipt does not freeze this prereg")
+            bound = check_binding(args.runtime_binding, self.prereg_path, "Q5_alpha", self.config, ALPHA_CKPT)
+            manifest = bound.pop("manifest")
+            self.receipts = {"freeze_receipt": {"path": str(Path(args.freeze_receipt).resolve()),
+                                                "sha256": sha256_file(args.freeze_receipt)}, **bound}
+        self.manifest = manifest
+        self.binding_sha = self.receipts.get("runtime_binding", {}).get("sha256")
         self.g1_prereg_sha = self.prereg["provenance"]["g1_prereg"]["sha256"]
-        self.out = Path(args.out).resolve()
-        root = (REPO / "outputs" / "probe").resolve()
-        if not str(self.out).startswith(str(root) + os.sep):
-            raise SystemExit(f"--out must be below {root}")
-        stamp = self.out / "RUN_STAMP.json"
-        want_stamp = {"prereg_sha256": self.prereg_sha, "mode": mode,
-                      "runtime_binding_sha256": self.receipts.get("runtime_binding", {}).get("sha256")}
-        if stamp.exists() and json.loads(stamp.read_text()) != want_stamp:
-            raise SystemExit("output dir belongs to a different prereg/mode/binding; refusing to mix runs")
-        self.out.mkdir(parents=True, exist_ok=True)
-        stamp.write_text(json.dumps(want_stamp, sort_keys=True))
-        self.index = self.out / "index.jsonl"
-        self.done = {}
-        if self.index.exists():
-            for line in self.index.read_text().splitlines():
-                row = json.loads(line)
-                self.done[row["path"]] = row["sha256"]
         self.baseline_index = self._baseline_indexes()
         obs = self.prereg["observations"]
         self.observations = obs[: args.n_obs] if mode == "smoke" else obs
         for o in self.observations:
             if sha256_file(o["trace"]) != o["trace_sha256"]:
                 raise SystemExit(f"source trace sha mismatch for {o['obs_id']}")
-        self.runner = OfflineRunner(str(ALPHA_CKPT), args.config)
-        from openwam.deploy.engine import _cfg_sha256, _code_version
+        self.ledger = Ledger(args.out, {"prereg_sha256": self.prereg_sha, "mode": mode, "runtime_binding_sha256": self.binding_sha})
+        self.runner = runner_factory(ALPHA_CKPT, self.config)
+        self.runtime = check_runtime(self.runner, manifest) if mode == "run" else describe_runtime(self.runner)
+        from openwam.deploy.engine import _code_version
 
         self.runtime_code = dict(_code_version())
-        self.runtime_config_sha256 = _cfg_sha256(self.runner.engine.cfg)
-        if mode == "run":
-            # the manifest pins every runtime file by sha256; the commit itself may move (other owners' files)
-            if self.runtime_code.get("dirty") or not self.runtime_code.get("commit"):
-                raise SystemExit(f"formal run needs a clean committed tree; got {self.runtime_code}")
+        if mode == "run" and (self.runtime_code.get("dirty") or not self.runtime_code.get("commit")):
+            raise SystemExit(f"formal run needs a clean committed tree; got {self.runtime_code}")
         self._sources = {}
         info = self.runner.precompute_prompts([self.source(o)["cond"]["prompt"] for o in self.observations])
         print(f"[init] {mode}: {len(self.observations)} obs; prompts {info}; code {self.runtime_code}", flush=True)
-
-    # -- protections ---------------------------------------------------------------------------
-    def _receipts(self, args) -> dict:
-        rec = json.loads(Path(args.freeze_receipt).read_text())
-        if rec.get("status") != "frozen" or rec.get("prereg_sha256") != self.prereg_sha:
-            raise SystemExit("G2 freeze receipt does not freeze this prereg")
-        bind_path = Path(args.runtime_binding)
-        bind = json.loads(bind_path.read_text())
-        if bind.get("status") != "jointly_bound" or bind.get("scope") != "Q5_alpha":
-            raise SystemExit("alpha runtime binding is not jointly bound for Q5")
-        if not all(isinstance((bind.get("signatures") or {}).get(k), str) and bind["signatures"][k].strip()
-                   for k in ("claude", "codex")):
-            raise SystemExit("runtime binding lacks both signatures")
-        man_path = Path(bind["manifest_path"])
-        if sha256_file(man_path) != bind["manifest_sha256"]:
-            raise SystemExit("runtime manifest differs from binding")
-        man = json.loads(man_path.read_text())
-        if man.get("prereg_sha256") != self.prereg_sha:
-            raise SystemExit("runtime manifest names another prereg")
-        for art in man["artifacts"]:
-            if sha256_file(art["path"]) != art["sha256"]:
-                raise SystemExit(f"runtime artifact changed: {art['path']}")
-        print(f"[init] {len(man['artifacts'])} runtime artifacts verified", flush=True)
-        return {"freeze_receipt": {"path": str(Path(args.freeze_receipt).resolve()), "sha256": sha256_file(args.freeze_receipt)},
-                "runtime_binding": {"path": str(bind_path.resolve()), "sha256": sha256_file(bind_path)},
-                "runtime_manifest": {"path": str(man_path), "sha256": bind["manifest_sha256"]},
-                "runtime_manifest_commit": man["runtime_commit"]}
 
     def _baseline_indexes(self) -> dict:
         out = {}
@@ -169,6 +116,8 @@ class Q5:
 
     def source(self, obs: dict) -> dict:
         if obs["obs_id"] not in self._sources:
+            from offline_runner import load_trace
+
             self._sources[obs["obs_id"]] = load_trace(obs["trace"])
         return self._sources[obs["obs_id"]]
 
@@ -183,84 +132,87 @@ class Q5:
         if (m.get("prereg_sha256") != self.g1_prereg_sha or m.get("source_trace_sha256") != obs["trace_sha256"]
                 or int(m["video_seed"]) != v or int(m["action_seed"]) != a):
             raise RuntimeError(f"baseline identity mismatch: {path}")
-        return {"trace": tr, "path": str(path), "sha256": want}
+        return {"trace": tr, "ref": {"path": str(path), "sha256": want}}
 
-    def reuse(self, path: Path) -> bool:
-        return str(path) in self.done and path.exists() and sha256_file(path) == self.done[str(path)]
+    # -- units -----------------------------------------------------------------------------------
+    def expect(self, obs, kind, vr, ar, vd, ad, base_r, base_d) -> dict:
+        return {"format": FORMAT, "kind": kind, "prereg_sha256": self.prereg_sha, "runtime_binding_sha256": self.binding_sha,
+                "obs_id": obs["obs_id"], "task": obs["task"], "episode": obs["episode"],
+                "source_trace_sha256": obs["trace_sha256"], "video_seed": vr, "action_seed": ar, "donor": [vd, ad],
+                "receiver_baseline": base_r["ref"], "donor_baseline": base_d["ref"]}
 
-    def save(self, obs, kind, path, src, res, vr, ar, base_r, base_d, extra) -> None:
+    def generate(self, obs, vr, ar, donor_trace) -> tuple[dict, dict]:
+        res = self.runner.rerun(self.source(obs), video_seed=vr, action_seed=ar, replay=donor_trace, record=True)
         pt = res["probe_trace"]
-        tr = {"meta": {"format": "openwam-g2-q5/1", "kind": kind, "prereg_sha256": self.prereg_sha,
-                       "source_trace_sha256": obs["trace_sha256"], "schedule": pt["schedule"],
-                       "video_seed": vr, "action_seed": ar,
-                       "receiver_baseline": {"path": base_r["path"], "sha256": base_r["sha256"]},
-                       "donor_baseline": {"path": base_d["path"], "sha256": base_d["sha256"]},
-                       "active_action_mask": pt["active_action_mask"],
-                       "runtime_code": self.runtime_code, "runtime_config_sha256": self.runtime_config_sha256,
-                       "receipts": self.receipts, **extra},
-              "cond": src["cond"], "init": pt["init"], "steps": pt["steps"],
-              "final": {**pt["final"], "actions_returned": np.asarray(res["actions"]).copy()}}
-        sha = atomic_torch_save(tr, path)
-        row = {"path": str(path), "sha256": sha, "kind": kind, "obs_id": obs["obs_id"], "task": obs["task"],
-               "episode": obs["episode"], "receiver": [vr, ar], "donor": extra["donor"], "prereg_sha256": self.prereg_sha}
-        append_jsonl(self.index, row)
-        self.done[str(path)] = sha
+        if self.mode == "run" and [list(map(float, s)) for s in pt["schedule"]] != self.runtime["schedule"]:
+            raise SystemExit(f"generation schedule differs from the bound runtime for {obs['obs_id']}")
+        return res, pt
 
-    # -- work ------------------------------------------------------------------------------------
-    def identity(self, obs: dict) -> None:
-        src, d = self.source(obs), self.out / obs["task"] / obs["obs_id"] / "identity"
-        for v in self.prereg["video_seeds"]:
-            for a in self.prereg["action_seeds"]:
-                path = d / f"r{v}-{a}.pt"
-                if self.reuse(path):
-                    continue
-                base = self.baseline(obs, v, a)
-                res = self.runner.rerun(src, video_seed=v, action_seed=a, replay=base["trace"], record=True)
-                bad = identity_mismatches(base["trace"], res["probe_trace"])
+    def unit(self, obs, kind, key, path, vr, ar, vd, ad) -> None:
+        base_r, base_d = self.baseline(obs, vr, ar), self.baseline(obs, vd, ad)
+        expect = self.expect(obs, kind, vr, ar, vd, ad, base_r, base_d)
+        if self.ledger.get(key):
+            tr = self.ledger.load(key)
+            check_meta(tr, expect, key)
+            if kind == "identity":
+                bad = identity_mismatches(base_r["trace"], tr)
                 if bad:
-                    raise RuntimeError(f"identity replay differs from baseline {obs['obs_id']} v{v} a{a}: {bad[:6]}")
-                self.save(obs, "identity", path, src, res, v, a, base, base, {"donor": [v, a], "role": "identity"})
+                    raise SystemExit(f"stored identity no longer matches its baseline {key}: {bad[:6]}")
+            return
+        res, pt = self.generate(obs, vr, ar, base_d["trace"])
+        tr = {"meta": {**expect, "schedule": pt["schedule"], "active_action_mask": pt["active_action_mask"],
+                       "runtime_code": self.runtime_code, "runtime_engine_config_sha256": self.runtime["engine_config_sha256"],
+                       "receipts": self.receipts, "role": "identity" if kind == "identity" else "primary_same_action"},
+              "cond": self.source(obs)["cond"], "init": pt["init"], "steps": pt["steps"],
+              "final": {**pt["final"], "actions_returned": np.asarray(res["actions"]).copy()}}
+        if kind == "identity":
+            bad = identity_mismatches(base_r["trace"], tr)
+            if bad:
+                self.ledger.fail(key, f"identity differs from baseline: {bad[:6]}")
+                raise SystemExit(f"identity replay differs from baseline {key}: {bad[:6]}")
+        self.ledger.commit(key, path, tr, kind=kind, obs_id=obs["obs_id"], task=obs["task"], episode=obs["episode"],
+                           receiver=[vr, ar], donor=[vd, ad])
 
-    def swap(self, obs: dict) -> None:
-        src, d = self.source(obs), self.out / obs["task"] / obs["obs_id"] / "swap"
-        for pair in self.prereg["pairs"]:
-            (vr, ar), (vd, ad) = pair["receiver"], pair["donor"]
-            path = d / f"r{vr}-{ar}_d{vd}-{ad}.pt"
-            if self.reuse(path):
-                continue
-            base_r, base_d = self.baseline(obs, vr, ar), self.baseline(obs, vd, ad)
-            res = self.runner.rerun(src, video_seed=vr, action_seed=ar, replay=base_d["trace"], record=True)
-            self.save(obs, "swap", path, src, res, vr, ar, base_r, base_d,
-                      {"donor": [vd, ad], "role": pair["pair_kind"]})
+    def keys(self, obs) -> list:
+        o, d = obs["obs_id"], self.ledger.out / obs["task"] / obs["obs_id"]
+        out = [("identity", f"identity|{o}|{v}-{a}", d / "identity" / f"r{v}-{a}.pt", v, a, v, a)
+               for v in self.prereg["video_seeds"] for a in self.prereg["action_seeds"]]
+        if self.mode == "run":
+            out += [("swap", f"swap|{o}|{p['receiver'][0]}-{p['receiver'][1]}|{p['donor'][0]}-{p['donor'][1]}",
+                     d / "swap" / f"r{p['receiver'][0]}-{p['receiver'][1]}_d{p['donor'][0]}-{p['donor'][1]}.pt",
+                     *p["receiver"], *p["donor"]) for p in self.prereg["pairs"]]
+        return out
 
     def run(self) -> None:
+        expected = []
         for obs in self.observations:
-            self.identity(obs)
-            if self.mode == "run":
-                self.swap(obs)
+            for kind, key, path, vr, ar, vd, ad in self.keys(obs):
+                self.unit(obs, kind, key, path, vr, ar, vd, ad)
+                expected.append(key)
             print(f"[{self.mode}] {obs['obs_id']} done", flush=True)
-        kinds = {}
-        for line in self.index.read_text().splitlines():
-            k = json.loads(line)["kind"]
-            kinds[k] = kinds.get(k, 0) + 1
-        want = {"identity": 16 * len(self.observations)}
+        self.ledger.require_exact(expected)
         if self.mode == "run":
-            want["swap"] = len(self.prereg["pairs"]) * len(self.observations)
-        if kinds != want:
-            raise SystemExit(f"index counts {kinds} != expected {want}")
-        print(f"[{self.mode}] complete: {kinds}", flush=True)
+            check_imports_bound(self.manifest)
+        print(f"[{self.mode}] complete: {len(expected)} units", flush=True)
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["run", "smoke"])
-    p.add_argument("--prereg", required=True)
-    p.add_argument("--out", required=True)
+    p.add_argument("mode", choices=["run", "smoke", "describe"])
+    p.add_argument("--prereg")
+    p.add_argument("--out")
     p.add_argument("--freeze-receipt")
     p.add_argument("--runtime-binding")
     p.add_argument("--config", default=None)
     p.add_argument("--n-obs", type=int, default=1, help="smoke only: first N observations")
     args = p.parse_args(argv)
+    if args.mode == "describe":
+        if not args.out:
+            raise SystemExit("describe needs --out (a new .json file)")
+        write_description(make_runner(ALPHA_CKPT, Path(args.config or DEFAULT_CONFIG).resolve()), args.out)
+        return
+    if not (args.prereg and args.out):
+        raise SystemExit("--prereg and --out are required")
     if args.mode == "run" and not (args.freeze_receipt and args.runtime_binding):
         raise SystemExit("run needs --freeze-receipt and --runtime-binding")
     Q5(args, args.mode).run()
