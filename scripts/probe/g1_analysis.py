@@ -119,7 +119,8 @@ def analyze(prereg,run,split):
             assert set(row[field])=={'l2','rms','max_abs','base_l2','base_rms','rel_l2'}
             assert all(x is None or x>=0 for x in row[field].values())
             assert (row[field]['rel_l2'] is None)==(row[field]['base_l2']==0)
-    isolated=lines(run/'isolated_check.jsonl');wanted={c['obs_id'] for c in reg['isolated_checks']}&set(omap)
+    wanted={c['obs_id'] for c in reg['isolated_checks']}&set(omap)
+    isolated=lines(run/'isolated_check.jsonl') if (run/'isolated_check.jsonl').exists() else []
     assert {(r['obs_id'],r['band']) for r in isolated}=={(o,b) for o in wanted for b in ('high','mid','low')}
     assert len(isolated)==len(wanted)*3 and all(r['prereg_sha256']==digest and finite(r) for r in isolated)
     proxies=lines(run/'decode_proxy.jsonl');assert len(proxies)==len(expected)
