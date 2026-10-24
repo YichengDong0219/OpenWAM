@@ -1518,6 +1518,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         probe_record = bool(probe and probe.get("record"))
         replay_video_steps = probe.get("replay_video_steps") if probe else None
+        replay_window = probe.get("replay_window") if probe else None
+        replay_window = None if replay_window is None else {int(i) for i in replay_window}
         probe_steps = [] if probe_record else None
         if replay_video_steps is not None:
             if dit_cache is not None:
@@ -1586,7 +1588,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             v_timestep = torch.tensor([t_v], dtype=dtype, device=device)
             a_timestep = torch.tensor([t_a], dtype=dtype, device=device)
 
-            if replay_video_steps is not None:
+            if replay_video_steps is not None and (replay_window is None or i in replay_window):
                 replayed = replay_video_steps[i].to(device=device, dtype=inputs_shared["latents"].dtype)
                 ref_latents = inputs_shared.get("first_frame_latents")
                 if ref_latents is not None:
@@ -1726,6 +1728,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     "actions_physical": np.asarray(actions).copy(),
                 },
                 "replay": replay_video_steps is not None,
+                "replay_window": None if replay_window is None else sorted(replay_window),
             }
         return result
 
@@ -1751,12 +1754,25 @@ class BaseWAMArchitecture(ABC, nn.Module):
             t_v_next, t_a_next = schedule[i + 1]
             if t_v != t_v_next or t_a != t_a_next:
                 executed.append(i)
-        missing = [i for i in executed if i not in steps]
-        if missing or set(steps) != set(executed):
-            raise ValueError(
-                f"probe replay steps {sorted(steps)} do not match this schedule's executed steps {executed}"
-            )
-        for i in executed:
+        window = probe.get("replay_window")
+        if window is None:
+            missing = [i for i in executed if i not in steps]
+            if missing or set(steps) != set(executed):
+                raise ValueError(
+                    f"probe replay steps {sorted(steps)} do not match this schedule's executed steps {executed}"
+                )
+            checked = executed
+        else:
+            # P1B windowed replay: overwrite only the listed executed steps; the others evolve normally.
+            window = [int(i) for i in window]
+            if not window or window != sorted(set(window)) or not set(window) <= set(executed):
+                raise ValueError(f"probe replay_window {window} must be a sorted non-empty subset of {executed}")
+            if set(steps) != set(window):
+                raise ValueError(f"probe replay steps {sorted(steps)} do not match replay_window {window}")
+            if probe.get("replay_video_final") is not None:
+                raise ValueError("probe replay_window does not support replay_video_final")
+            checked = window
+        for i in checked:
             if abs(float(t_vs[i]) - float(schedule[i][0])) > 1e-6 * max(1.0, abs(float(schedule[i][0]))):
                 raise ValueError(f"probe replay t_v mismatch at step {i}: {t_vs[i]} vs {schedule[i][0]}")
             if tuple(steps[i].shape) != tuple(live_latents.shape):
