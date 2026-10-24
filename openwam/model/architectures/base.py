@@ -1519,7 +1519,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         probe_record = bool(probe and probe.get("record"))
         replay_video_steps = probe.get("replay_video_steps") if probe else None
         replay_window = probe.get("replay_window") if probe else None
-        replay_window = None if replay_window is None else {int(i) for i in replay_window}
+        replay_window = None if replay_window is None else set(replay_window)
         probe_steps = [] if probe_record else None
         if replay_video_steps is not None:
             if dit_cache is not None:
@@ -1764,7 +1764,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             checked = executed
         else:
             # P1B windowed replay: overwrite only the listed executed steps; the others evolve normally.
-            window = [int(i) for i in window]
+            if any(isinstance(i, bool) or not isinstance(i, int) for i in window):
+                raise ValueError(f"probe replay_window indices must be ints; got {window!r}")
+            window = list(window)
             if not window or window != sorted(set(window)) or not set(window) <= set(executed):
                 raise ValueError(f"probe replay_window {window} must be a sorted non-empty subset of {executed}")
             if set(steps) != set(window):

@@ -24,7 +24,8 @@ steps = []
 for i, (tv, ta) in enumerate(SCHED[:-1]):
     z = eps.clone() if i == 0 else torch.randn(SHAPE, generator=g).to(torch.bfloat16)
     z[:, :, :1] = first
-    steps.append({"i": i, "t_v": tv, "t_a": ta, "video_latents_in": z})
+    steps.append({"i": i, "t_v": tv, "t_a": ta, "sigma_v": tv / 1000, "sigma_a": ta / 1000, "video_latents_in": z,
+                  "action_latents_in": torch.randn((1, 32, 80), generator=g).to(torch.bfloat16)})
 c0 = {"meta": {"schedule": SCHED, "num_frames": 9, "action_num_frames": 33, "active_action_mask": torch.ones(80, dtype=torch.bool)},
       "init": {"video_noise": eps}, "steps": steps, "final": {"video_latents": eps.clone()}}
 target = torch.randn(SHAPE, generator=g).to(torch.bfloat16)
@@ -68,7 +69,8 @@ def recorded(probe, window, tamper=None):
         z = probe["replay_video_steps"][i].clone() if i in window else (s["video_latents_in"].clone() if i < min(window)
                                                                        else torch.randn(SHAPE, generator=g).to(torch.bfloat16))
         z[:, :, :1] = first
-        st.append({"i": i, "video_latents_in": z})
+        st.append({**{k: s[k] for k in ("i", "t_v", "t_a", "sigma_v", "sigma_a")}, "video_latents_in": z,
+                   "action_latents_in": s["action_latents_in"].clone() if i < min(window) else torch.randn((1, 32, 80), generator=g).to(torch.bfloat16)})
     tr = {"steps": st, "replay_window": list(window)}
     if tamper:
         tamper(tr)
@@ -102,6 +104,69 @@ checks["base: no replay_window -> original all-step rule (accepted with all step
 checks["base: no replay_window and a missing step -> refused (original behaviour)"] = not ok({**full, "replay_video_steps": {i: live for i in range(9)}})
 bad_dtype = probe_for([4], steps_override={4: live.float()})
 checks["base: windowed step with wrong dtype refused"] = not ok(bad_dtype)
+
+# R81 counterexamples
+def dup6(t):
+    t["steps"][6] = dict(t["steps"][5])
+checks["window_checks: step 6 replaced by a duplicate of step 5 (index 5 twice, 6 missing) -> fail"] = not B.window_checks(c0, recorded(pm, B.WINDOWS["M"], dup6), pm, B.WINDOWS["M"])["all_passed"]
+checks["window_checks: a step index relabelled -> fail"] = not B.window_checks(c0, recorded(pm, B.WINDOWS["M"], lambda t: t["steps"][7].__setitem__("i", 8)), pm, B.WINDOWS["M"])["all_passed"]
+checks["window_checks: a step t_a differs from C0/schedule -> fail"] = not B.window_checks(c0, recorded(pm, B.WINDOWS["M"], lambda t: t["steps"][2].__setitem__("t_a", 1.0)), pm, B.WINDOWS["M"])["all_passed"]
+checks["window_checks: a step missing -> fail"] = not B.window_checks(c0, recorded(pm, B.WINDOWS["M"], lambda t: t["steps"].pop()), pm, B.WINDOWS["M"])["all_passed"]
+checks["window_checks: pre-window ACTION state differs from C0 -> fail"] = not B.window_checks(c0, recorded(pm, B.WINDOWS["M"], lambda t: t["steps"][1].__setitem__("action_latents_in", torch.zeros((1, 32, 80), dtype=torch.bfloat16))), pm, B.WINDOWS["M"])["all_passed"]
+checks["base: float window index 4.9 refused (no silent truncation)"] = not ok(probe_for([4.9], steps_override={4: live}))
+checks["base: bool window index refused"] = not ok(probe_for([True], steps_override={1: live}))
+
+# seal-anchored P1A reference (synthetic sealed shards)
+import hashlib, shutil, tempfile
+import numpy as np
+
+
+def make_seal(units_per_shard):
+    root = Path(tempfile.mkdtemp()); shards = []
+    for k, units in enumerate(units_per_shard):
+        d = root / f"s{k}"; (d / "units").mkdir(parents=True); rows = []
+        for (o, c, v, a) in units:
+            p = d / "units" / f"{o}_{c}_{v}_{a}.npz"
+            with open(p, "wb") as f:
+                np.savez(f, actions_physical=np.full((32, 20), float(v + a)), actions_normalized=np.zeros((32, 80)))
+            rows.append({"ok": True, "unit": f"{o}|{c}|{v}|{a}", "obs": o, "cond": c, "video_seed": v, "action_seed": a,
+                         "artifacts": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}]})
+        (d / "journal.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        dig, n = B.dir_file_map_digest(d)
+        shards.append({"k": k, "output_dir": str(d), "directory_file_map_sha256": dig, "files": n})
+    seal = root / "seal.json"; seal.write_text(json.dumps({"format": "p1a-production-seal/1", "shards": shards}))
+    return {"path": str(seal), "sha256": hashlib.sha256(seal.read_bytes()).hexdigest()}, shards
+
+
+bind = {"observations": ["o1"], "video_seeds": [1001], "action_seeds": [2001, 2002],
+        "scatter": {"video_seed": 1001, "action_seeds": [2003]}}
+need = B.needed_reference_units(bind)
+units = sorted(need)
+seal_ref, shards = make_seal([units[:5], units[5:9], units[9:], []])
+checks["p1a_reference: accepts an intact seal with every needed unit"] = not refuses(lambda: B.p1a_reference(seal_ref, need))
+checks["p1a_reference: empty / missing seal reference refused (never skipped)"] = refuses(lambda: B.p1a_reference({}, need)) and refuses(lambda: B.p1a_reference(None, need))
+
+
+def tampered(fn):
+    sr, sh = make_seal([units[:5], units[5:9], units[9:], []]); fn(sh); return refuses(lambda: B.p1a_reference(sr, need))
+
+
+def rewrite_npz_and_journal(sh):   # rewrite an npz AND its journal hash consistently: the sealed dir digest catches it
+    d = Path(sh[0]["output_dir"]); rows = [json.loads(x) for x in (d / "journal.jsonl").read_text().splitlines()]
+    p = Path(rows[0]["artifacts"][0]["path"])
+    with open(p, "wb") as f:
+        np.savez(f, actions_physical=np.zeros((32, 20)), actions_normalized=np.zeros((32, 80)))
+    rows[0]["artifacts"][0]["sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
+    (d / "journal.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+checks["p1a_reference: npz and journal hash rewritten together -> refused (sealed directory digest)"] = tampered(rewrite_npz_and_journal)
+sr2, sh2 = make_seal([units[:5] + units[:1], units[5:9], units[9:], []])
+checks["p1a_reference: duplicate reference unit -> refused"] = refuses(lambda: B.p1a_reference(sr2, need))
+sr3, sh3 = make_seal([units[:5], units[5:9], units[9:-1], []])
+checks["p1a_reference: a needed unit missing -> refused"] = refuses(lambda: B.p1a_reference(sr3, need))
+sr4 = dict(seal_ref, sha256="0" * 64)
+checks["p1a_reference: seal file SHA mismatch -> refused"] = refuses(lambda: B.p1a_reference(sr4, need))
 
 failed = [k for k, v in checks.items() if not v]
 print("RESULT " + json.dumps({"n": len(checks), "failed": failed, "checks": checks}))

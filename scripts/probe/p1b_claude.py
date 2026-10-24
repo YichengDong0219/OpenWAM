@@ -13,13 +13,15 @@ Per receiver observation (the 26 reused P1A sources), video seed 1001, action se
 Checks per windowed run: the recorded video input at every step in W equals the constructed clamp (future frames) and
 the trace's replay_window equals W; steps before the first window step must equal C0's recorded input bit for bit
 (nothing has been changed yet); later out-of-window steps are the normally evolved state (recorded, not asserted).
-For window A the actions must equal the P1A production actions of the same (obs, condition, seed) bit for bit; the
-sealed P1A shard dirs come from binding["p1a_check"] (all-step windowed replay is the
+C0, scatter and window-A actions must equal the P1A production actions of the same (obs, condition/C0/scatter, seed)
+bit for bit; the reference is anchored to the immutable P1A production seal named by binding["p1a_seal"] (seal SHA,
+canonical directory digests, duplicate-free success journals, every needed unit present) and checked before the model
+loads (all-step windowed replay is the
 P1A clamp; P1A also replayed the final video, which does not touch actions).
 Outputs: units/<obs>/<cond>_<W>_v<v>_a<a>.npz + traces/<obs>/<cond>_<W>_v<v>_a<a>.pt (full trace kept for audit),
 C0/identity traces, targets/, journal.jsonl (success-only, p1b-claude-unit/1), failures.jsonl; resume refused on any
 failure / changed artifact / orphan (as p1a). No metric is computed here.
-Usage: p1b_claude.py run --binding B --out D       (the P1A reference dirs come only from binding["p1a_check"])
+Usage: p1b_claude.py run --binding B --out D       (the P1A reference comes only from binding["p1a_seal"])
        p1b_claude.py dry-run --binding B               (binding + sources; no model, no output)
 """
 from __future__ import annotations
@@ -70,15 +72,25 @@ def window_replay(c0: dict, target: torch.Tensor, window: list, ntt: float) -> d
 
 
 def window_checks(c0: dict, tr: dict, probe: dict, window: list) -> dict:
-    """In-window inputs equal the clamp; pre-window inputs equal C0; the recorded window equals W."""
+    """First the complete ordered unique executed indices and their timesteps (vs C0 and the schedule); then
+    in-window inputs equal the clamp; pre-window video AND action inputs equal C0; frame 0 receiver; window = W."""
     first = min(window)
-    out = {"recorded_window": tr.get("replay_window") == list(window), "n_steps": len(tr["steps"]) == len(c0["steps"])}
+    sched = [tuple(map(float, x)) for x in c0["meta"]["schedule"]]
+    idx = [s.get("i") for s in tr["steps"]]
+    out = {"recorded_window": tr.get("replay_window") == list(window),
+           "indices_complete_ordered_unique": idx == list(range(len(sched) - 1)) and len(tr["steps"]) == len(c0["steps"]),
+           "timesteps_match_C0_and_schedule": len(tr["steps"]) == len(c0["steps"]) and all(
+               s.get(k) == c.get(k) for s, c in zip(tr["steps"], c0["steps"]) for k in ("i", "t_v", "t_a", "sigma_v", "sigma_a"))
+           and all(float(s["t_v"]) == sched[int(s["i"])][0] and float(s["t_a"]) == sched[int(s["i"])][1] for s in tr["steps"])}
+    if not (out["indices_complete_ordered_unique"] and out["timesteps_match_C0_and_schedule"]):
+        return {"all_passed": False, "checks": out}
     for s, c in zip(tr["steps"], c0["steps"]):
         i = int(s["i"])
         if i in window:
             out[f"step{i}.clamped"] = bool(torch.equal(s["video_latents_in"][:, :, 1:], probe["replay_video_steps"][i][:, :, 1:]))
         elif i < first:
-            out[f"step{i}.pre_window_equals_C0"] = bool(torch.equal(s["video_latents_in"], c["video_latents_in"]))
+            out[f"step{i}.pre_window_equals_C0"] = bool(torch.equal(s["video_latents_in"], c["video_latents_in"])
+                                                       and torch.equal(s["action_latents_in"], c["action_latents_in"]))
         out[f"step{i}.frame0_receiver"] = bool(torch.equal(s["video_latents_in"][:, :, :1], c["video_latents_in"][:, :, :1]))
     return {"all_passed": all(out.values()), "checks": out}
 
@@ -107,7 +119,7 @@ def check_binding(bpath: Path):
     sm = b["source_manifest"]
     if A.sha_file(sm["path"]) != sm["sha256"]:
         raise SystemExit("source manifest changed")
-    for k in ("observations", "video_seeds", "action_seeds", "scatter", "max_reruns", "p1a_check"):
+    for k in ("observations", "video_seeds", "action_seeds", "scatter", "max_reruns", "p1a_seal"):
         if k not in b:
             raise SystemExit(f"binding lacks {k}")
     return b, man, json.loads(Path(sm["path"]).read_text())
@@ -157,27 +169,64 @@ def audit_outdir(out: Path) -> dict:
     return done
 
 
-def p1a_actions(dirs) -> dict:
-    """(obs, cond, v, a) -> P1A production actions_physical npz path, from the sealed shard journals."""
+def dir_file_map_digest(root: Path) -> tuple[str, int]:
+    """Canonical directory map digest (as the P1A production seal): sha256 of sorted {relpath: sha256} JSON."""
+    actual = {str(p.relative_to(root)): A.sha_file(p) for p in root.rglob("*") if p.is_file()}
+    return hashlib.sha256(json.dumps(actual, sort_keys=True, separators=(",", ":")).encode()).hexdigest(), len(actual)
+
+
+def p1a_reference(seal_ref: dict, needed: set) -> dict:
+    """(obs, cond, v, a) -> P1A production npz path, anchored to the immutable P1A production seal: seal SHA, every
+    shard's canonical directory map digest and file count, success-only journals without duplicate units, and every
+    needed unit present exactly once. Empty / missing seal is refused (window-A and C0/scatter checks never skip)."""
+    if not seal_ref or not seal_ref.get("path") or not seal_ref.get("sha256"):
+        raise SystemExit("binding lacks the P1A production seal reference")
+    if A.sha_file(seal_ref["path"]) != seal_ref["sha256"]:
+        raise SystemExit("P1A production seal changed")
+    seal = json.loads(Path(seal_ref["path"]).read_text())
+    if seal.get("format") != "p1a-production-seal/1" or len(seal.get("shards", [])) != 4:
+        raise SystemExit("not a four-shard P1A production seal")
     out = {}
-    for d in dirs:
-        for line in (Path(d) / "journal.jsonl").read_text().splitlines():
+    for sh in seal["shards"]:
+        root = Path(sh["output_dir"])
+        dig, n = dir_file_map_digest(root)
+        if dig != sh["directory_file_map_sha256"] or n != sh["files"]:
+            raise SystemExit(f"P1A sealed directory changed: {root}")
+        seen = set()
+        for line in (root / "journal.jsonl").read_text().splitlines():
             r = json.loads(line)
-            if r.get("cond") in CONDS:
+            if r.get("ok") is not True or r["unit"] in seen:
+                raise SystemExit(f"P1A journal not success-only / duplicate unit: {r.get('unit')}")
+            seen.add(r["unit"])
+            if r.get("cond") in ("C0", "scatter") + CONDS:
+                key = (r["obs"], r["cond"], r["video_seed"], r["action_seed"])
                 arts = [x for x in r["artifacts"] if x["path"].endswith(".npz")]
-                if len(arts) != 1 or A.sha_file(arts[0]["path"]) != arts[0]["sha256"]:
-                    raise SystemExit(f"P1A reference artifact missing or changed: {r['unit']}")
-                out[(r["obs"], r["cond"], r["video_seed"], r["action_seed"])] = arts[0]["path"]
-    return out
+                if key in out or len(arts) != 1:
+                    raise SystemExit(f"P1A duplicate / malformed reference unit {key}")
+                out[key] = arts[0]["path"]
+    missing = sorted(map(str, needed - set(out)))
+    if missing:
+        raise SystemExit(f"P1A reference lacks needed units: {missing[:5]}")
+    return {k: out[k] for k in needed}
+
+
+def needed_reference_units(b: dict) -> set:
+    keys = set()
+    for o in b["observations"]:
+        for v in b["video_seeds"]:
+            for a in b["action_seeds"]:
+                keys |= {(o, c, v, a) for c in ("C0",) + CONDS}
+        keys |= {(o, "scatter", b["scatter"]["video_seed"], a) for a in b["scatter"]["action_seeds"]}
+    return keys
 
 
 # ---------------------------------------------------------------- GPU driver
 class P1B:
-    def __init__(self, out: Path, b: dict, man: dict, manifest: dict, p1a_dirs):
+    def __init__(self, out: Path, b: dict, man: dict, manifest: dict):
         from offline_runner import OfflineRunner, load_trace
         self.out, self.b, self.manifest = out, b, manifest
         self.done = audit_outdir(out)
-        self.p1a = p1a_actions(p1a_dirs) if p1a_dirs else None
+        self.p1a = p1a_reference(b["p1a_seal"], needed_reference_units(b))   # before the model loads
         self.records, self.traces, self.targets = {}, {}, {}
         needed = set(b["observations"])
         for o in b["observations"]:
@@ -219,6 +268,12 @@ class P1B:
         tr = A.native_trace({k: x for k, x in pt.items() if k not in ("replay_window",)}, tr0, v, a)
         tr["replay_window"] = rw
         return tr, time.time() - t0
+
+    def same_as_p1a(self, unit, key, tr):
+        with np.load(self.p1a[key]) as z:
+            if not np.array_equal(z["actions_physical"], np.asarray(tr["final"]["actions_physical"], dtype=np.float64)):
+                self.fail(unit, f"actions differ from the P1A production unit {key}")
+        return True
 
     def save(self, unit, obs, kind, cond, window, v, a, tr, el, extra=None):
         name = f"{cond}_{window}_v{v}_a{a}" if window else f"{cond}_v{v}_a{a}"
@@ -280,7 +335,8 @@ class P1B:
                         c0 = torch.load(tp, map_location="cpu", weights_only=False)
                     else:
                         c0, el = self.generate(obs, v, a)
-                        self.save(u, obs, "C0", "C0", None, v, a, c0, el)
+                        self.save(u, obs, "C0", "C0", None, v, a, c0, el,
+                                  {"equals_p1a_production": self.same_as_p1a(u, (obs, "C0", v, a), c0)})
                     iu = f"{obs}|identity|{v}|{a}"
                     if iu not in self.done:
                         rep = A.replay_of(c0)
@@ -309,19 +365,16 @@ class P1B:
                             ex = {"window_checks": wc, "target_sha256": A.tensor_sha(target),
                                   "target_coefficients": {int(s["i"]): 1.0 - float(s["t_v"]) / self.ntt for s in c0["steps"] if int(s["i"]) in steps},
                                   **extra}
-                            if w == "A" and self.p1a is not None:
-                                with np.load(self.p1a[(obs, c, v, a)]) as z:
-                                    same = bool(np.array_equal(z["actions_physical"], np.asarray(tr["final"]["actions_physical"], dtype=np.float64)))
-                                if not same:
-                                    self.fail(wu, "window A actions differ from the P1A production actions of the same unit")
-                                ex["equals_p1a_production"] = True
+                            if w == "A":
+                                ex["equals_p1a_production"] = self.same_as_p1a(wu, (obs, c, v, a), tr)
                             self.save(wu, obs, "window", c, w, v, a, tr, el, ex)
             sv, sas = b["scatter"]["video_seed"], b["scatter"]["action_seeds"]
             for a in sas:
                 u = f"{obs}|scatter|{sv}|{a}"
                 if u not in self.done:
                     tr, el = self.generate(obs, sv, a)
-                    self.save(u, obs, "scatter", "scatter", None, sv, a, tr, el)
+                    self.save(u, obs, "scatter", "scatter", None, sv, a, tr, el,
+                              {"equals_p1a_production": self.same_as_p1a(u, (obs, "scatter", sv, a), tr)})
 
 
 def main(argv=None):
@@ -335,6 +388,7 @@ def main(argv=None):
         b, man, manifest = check_binding(bpath)
         for o in b["observations"]:
             A.verify_source(manifest["sources"][o])
+        p1a_reference(b["p1a_seal"], needed_reference_units(b))
         n = len(b["observations"]) * (len(b["video_seeds"]) * len(b["action_seeds"]) * (2 + len(CONDS) * len(WINDOWS)) + len(b["scatter"]["action_seeds"]))
         print(json.dumps({"binding_sha256": A.sha_file(bpath), "observations": b["observations"], "planned_reruns": n,
                           "max_reruns": b["max_reruns"], "artifacts": len(man["artifacts"])}))
@@ -344,7 +398,7 @@ def main(argv=None):
     b, man, manifest = check_binding(bpath)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    meta = {"binding": str(bpath), "binding_sha256": A.sha_file(bpath), "p1a_check": b["p1a_check"],
+    meta = {"binding": str(bpath), "binding_sha256": A.sha_file(bpath), "p1a_seal": b["p1a_seal"],
             "commit": subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()}
     rm = out / "run_meta.json"
     if rm.exists():
@@ -352,7 +406,7 @@ def main(argv=None):
             raise SystemExit("resume with another binding / commit is refused")
     else:
         rm.write_text(json.dumps(meta, indent=1))
-    drv = P1B(out, b, man, manifest, b["p1a_check"])
+    drv = P1B(out, b, man, manifest)
     drv.run()
     print(json.dumps({"done_units": len(drv.done), "reruns_this_invocation_total": drv.reruns}))
 
