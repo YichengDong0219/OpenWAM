@@ -11,15 +11,16 @@ Per receiver observation (the 26 reused P1A sources), video seed 1001, action se
                the stream evolves normally from whatever state the previous step produced (no C0 back-fill, no reset);
                no replay_video_final. Frame 0 stays the receiver's.
 Checks per windowed run: the recorded video input at every step in W equals the constructed clamp (future frames) and
-the trace's replay_window equals W; at every executed step outside W the input is NOT the clamp object (it is the
-normally evolved state; for steps before the first window step it must equal C0's recorded input bit for bit, since
-nothing has been changed yet). For window A the actions must equal the P1A production actions of the same (obs,
-condition, seed) bit for bit when ``--p1a-check`` points at the sealed P1A shard dirs (all-step windowed replay is the
+the trace's replay_window equals W; steps before the first window step must equal C0's recorded input bit for bit
+(nothing has been changed yet); later out-of-window steps are the normally evolved state (recorded, not asserted).
+For window A the actions must equal the P1A production actions of the same (obs, condition, seed) bit for bit; the
+sealed P1A shard dirs come from binding["p1a_check"] (all-step windowed replay is the
 P1A clamp; P1A also replayed the final video, which does not touch actions).
 Outputs: units/<obs>/<cond>_<W>_v<v>_a<a>.npz + traces/<obs>/<cond>_<W>_v<v>_a<a>.pt (full trace kept for audit),
 C0/identity traces, targets/, journal.jsonl (success-only, p1b-claude-unit/1), failures.jsonl; resume refused on any
 failure / changed artifact / orphan (as p1a). No metric is computed here.
-Usage: p1b_claude.py run --binding B --out D [--p1a-check DIR ...]
+Usage: p1b_claude.py run --binding B --out D       (the P1A reference dirs come only from binding["p1a_check"])
+       p1b_claude.py dry-run --binding B               (binding + sources; no model, no output)
 """
 from __future__ import annotations
 
@@ -106,7 +107,7 @@ def check_binding(bpath: Path):
     sm = b["source_manifest"]
     if A.sha_file(sm["path"]) != sm["sha256"]:
         raise SystemExit("source manifest changed")
-    for k in ("observations", "video_seeds", "action_seeds", "scatter", "max_reruns"):
+    for k in ("observations", "video_seeds", "action_seeds", "scatter", "max_reruns", "p1a_check"):
         if k not in b:
             raise SystemExit(f"binding lacks {k}")
     return b, man, json.loads(Path(sm["path"]).read_text())
@@ -327,7 +328,6 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run"); r.add_argument("--binding", required=True); r.add_argument("--out", required=True)
-    r.add_argument("--p1a-check", nargs="*", default=[])
     d = sub.add_parser("dry-run"); d.add_argument("--binding", required=True)
     a = ap.parse_args(argv)
     bpath = Path(a.binding).resolve()
@@ -344,7 +344,7 @@ def main(argv=None):
     b, man, manifest = check_binding(bpath)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    meta = {"binding": str(bpath), "binding_sha256": A.sha_file(bpath), "p1a_check": a.p1a_check,
+    meta = {"binding": str(bpath), "binding_sha256": A.sha_file(bpath), "p1a_check": b["p1a_check"],
             "commit": subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()}
     rm = out / "run_meta.json"
     if rm.exists():
@@ -352,7 +352,7 @@ def main(argv=None):
             raise SystemExit("resume with another binding / commit is refused")
     else:
         rm.write_text(json.dumps(meta, indent=1))
-    drv = P1B(out, b, man, manifest, a.p1a_check)
+    drv = P1B(out, b, man, manifest, b["p1a_check"])
     drv.run()
     print(json.dumps({"done_units": len(drv.done), "reruns_this_invocation_total": drv.reruns}))
 
