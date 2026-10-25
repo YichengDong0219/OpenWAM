@@ -1,0 +1,263 @@
+{
+ "format": "recovery-trace-plan/1",
+ "source_reference_sha256": "8e124efdf1dc1210c8bdbd81cec2678015d19bff5168c211aa1a82d57780aa38",
+ "num_train_timesteps": 1000.0,
+ "schedule": [
+  [
+   1000.0,
+   1000.0
+  ],
+  [
+   978.2608642578125,
+   978.2608642578125
+  ],
+  [
+   952.3810424804688,
+   952.3810424804688
+  ],
+  [
+   921.0526123046875,
+   921.0526123046875
+  ],
+  [
+   882.3529052734375,
+   882.3529052734375
+  ],
+  [
+   833.3333129882812,
+   833.3333129882812
+  ],
+  [
+   769.2307739257812,
+   769.2307739257812
+  ],
+  [
+   681.8181762695312,
+   681.8181762695312
+  ],
+  [
+   555.5556030273438,
+   555.5556030273438
+  ],
+  [
+   357.1428527832031,
+   357.1428527832031
+  ],
+  [
+   0.0,
+   0.0
+  ]
+ ],
+ "executed_steps": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9
+ ],
+ "num_frames": 9,
+ "action_num_frames": 33,
+ "active_action_mask": [
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false
+ ],
+ "cond": {
+  "first_frame_latents": {
+   "shape": [
+    1,
+    48,
+    1,
+    24,
+    20
+   ],
+   "dtype": "torch.bfloat16"
+  },
+  "proprio": {
+   "shape": [
+    80
+   ],
+   "dtype": "torch.bfloat16"
+  }
+ },
+ "init": {
+  "video_noise": {
+   "shape": [
+    1,
+    48,
+    3,
+    24,
+    20
+   ],
+   "dtype": "torch.bfloat16"
+  },
+  "action_noise": {
+   "shape": [
+    1,
+    32,
+    80
+   ],
+   "dtype": "torch.bfloat16"
+  }
+ },
+ "step_scalar_keys": [
+  "action_stepping",
+  "cache_hit",
+  "i",
+  "sigma_a",
+  "sigma_v",
+  "t_a",
+  "t_v",
+  "video_stepping"
+ ],
+ "step_tensors": {
+  "video_latents_in": {
+   "shape": [
+    1,
+    48,
+    3,
+    24,
+    20
+   ],
+   "dtype": "torch.bfloat16"
+  },
+  "action_latents_in": {
+   "shape": [
+    1,
+    32,
+    80
+   ],
+   "dtype": "torch.bfloat16"
+  },
+  "video_velocity": {
+   "shape": [
+    1,
+    48,
+    3,
+    24,
+    20
+   ],
+   "dtype": "torch.bfloat16"
+  },
+  "action_velocity": {
+   "shape": [
+    1,
+    32,
+    80
+   ],
+   "dtype": "torch.bfloat16"
+  }
+ },
+ "final_tensors": {
+  "video_latents": {
+   "shape": [
+    1,
+    48,
+    3,
+    24,
+    20
+   ],
+   "dtype": "torch.bfloat16"
+  },
+  "action_latents": {
+   "shape": [
+    1,
+    32,
+    80
+   ],
+   "dtype": "torch.bfloat16"
+  }
+ },
+ "final_arrays": {
+  "actions_normalized": [
+   32,
+   80
+  ],
+  "actions_physical": [
+   32,
+   20
+  ]
+ }
+}

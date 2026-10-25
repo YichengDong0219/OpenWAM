@@ -84,6 +84,15 @@ class Ledger:
         self._write(st)
         self._event({"event": "settle", "phase": act["phase"], "actual_wall_s": actual_wall, **outcome})
 
+    def unresolved(self, reason: str, observed: dict) -> None:
+        """No verified end/cleanup evidence: keep the allocation ACTIVE with its full reservation (conservatively charged)
+        and halt. Only verified same-token end/cleanup evidence may later settle it; nothing is released here."""
+        st = self.state()
+        st["halted"], st["halt_reason"] = True, f"unresolved allocation: {reason}"
+        st["unresolved_allocation"] = {**(st["active"] or {}), "observed": observed, "time": _now()}
+        self._write(st)
+        self._event({"event": "unresolved", "reason": reason, "observed": observed})
+
     def update(self, **fields) -> None:
         st = self.state()
         st.update(fields)

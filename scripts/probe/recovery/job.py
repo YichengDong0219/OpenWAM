@@ -144,8 +144,15 @@ def episode(a) -> int:
     (out / "import_origin.json").write_text(json.dumps(origins))
     if not all(o and all(Path(x).resolve().is_relative_to(ROOT) for x in o.splitlines()) for o in origins.values()):
         raise SystemExit(f"runtime imports outside {ROOT}: {origins}")
-    manifest = json.loads(Path(a.manifest).read_text())
+    raw = Path(a.manifest).read_bytes()
+    import hashlib
+    if hashlib.sha256(raw).hexdigest() != a.expected_manifest_sha:
+        raise SystemExit("manifest SHA differs from the controller's sealed receipt")
+    manifest = json.loads(raw)
     total = len(manifest["entries"])
+    if not (0 <= a.episode < total) or manifest["entries"][a.episode]["seed"] != a.seed \
+            or manifest["entries"][a.episode]["episode"] != a.episode:
+        raise SystemExit(f"manifest entry {a.episode} does not hold seed {a.seed}")
     sampler = MemSampler(out / "gpu_mem.csv")
     sampler.start()
     server_log = open(out / "server.log", "w")
@@ -206,6 +213,7 @@ def main() -> int:
     e = sub.add_parser("episode"); e.add_argument("--out", type=Path, required=True)
     e.add_argument("--arm", choices=("B0", "B1", "B2"), required=True)
     e.add_argument("--manifest", type=Path, required=True); e.add_argument("--episode", type=int, required=True)
+    e.add_argument("--expected-manifest-sha", required=True); e.add_argument("--seed", type=int, required=True)
     e.add_argument("--port", type=int, default=8871)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=False)

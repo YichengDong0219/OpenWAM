@@ -141,33 +141,70 @@ def _finite(t) -> bool:
     return (not torch.is_tensor(t)) or (not t.is_floating_point()) or bool(torch.isfinite(t.float()).all())
 
 
-def executed_steps(schedule) -> list[int]:
-    sch = [tuple(map(float, x)) for x in schedule]
-    return [i for i in range(len(sch) - 1) if sch[i] != sch[i + 1]]
+PLAN = json.loads((HERE.parent / "trace_plan.json").read_text())
 
 
-def check_clamp(ref: dict, cand: dict, ref_sha: str, ntt: float = 1000.0) -> list[str]:
-    """B2 candidate: every executed step's future = (1-s)*R_final + s*own initial noise; frame 0 = own first frame."""
+def _sig_ok(t, sig) -> bool:
+    return torch.is_tensor(t) and list(t.shape) == sig["shape"] and str(t.dtype) == sig["dtype"] and _finite(t)
+
+
+def check_trace(tr: dict, seeds: tuple[int, int], label: str) -> list[str]:
+    """Full schema check of an online probe trace against the FROZEN plan (not against the trace's own claims)."""
+    bad, m = [], tr.get("meta", {})
+    if [[float(a), float(b)] for a, b in m.get("schedule", [])] != PLAN["schedule"]:
+        bad.append(f"{label}: schedule != frozen plan")
+    if (m.get("num_frames"), m.get("action_num_frames")) != (PLAN["num_frames"], PLAN["action_num_frames"]):
+        bad.append(f"{label}: frame counts")
+    mask = m.get("active_action_mask")
+    if mask is None or [bool(x) for x in torch.as_tensor(mask).tolist()] != PLAN["active_action_mask"]:
+        bad.append(f"{label}: action mask")
+    if (m.get("video_seed"), m.get("action_seed")) != tuple(seeds):
+        bad.append(f"{label}: seeds {m.get('video_seed'), m.get('action_seed')} != {seeds}")
+    for k, sig in PLAN["cond"].items():
+        if not _sig_ok(tr.get("cond", {}).get(k), sig):
+            bad.append(f"{label}: cond.{k}")
+    for k, sig in PLAN["init"].items():
+        if not _sig_ok(tr.get("init", {}).get(k), sig):
+            bad.append(f"{label}: init.{k}")
+    steps = tr.get("steps") or []
+    if [int(x.get("i", -1)) for x in steps] != PLAN["executed_steps"]:
+        bad.append(f"{label}: forward steps {[x.get('i') for x in steps]} != {PLAN['executed_steps']}")
+    for x in steps:
+        i = int(x.get("i", -1))
+        if set(PLAN["step_scalar_keys"]) - set(x) or set(PLAN["step_tensors"]) - set(x):
+            bad.append(f"{label}: step {i} keys"); continue
+        if 0 <= i < len(PLAN["schedule"]) and (float(x["t_v"]), float(x["t_a"])) != tuple(PLAN["schedule"][i]):
+            bad.append(f"{label}: step {i} t_v/t_a")
+        for k, sig in PLAN["step_tensors"].items():
+            if not _sig_ok(x[k], sig):
+                bad.append(f"{label}: step {i}.{k}")
+    for k, sig in PLAN["final_tensors"].items():
+        if not _sig_ok(tr.get("final", {}).get(k), sig):
+            bad.append(f"{label}: final.{k}")
+    for k, shape in PLAN["final_arrays"].items():
+        a = tr.get("final", {}).get(k)
+        if a is None or list(torch.as_tensor(a).shape) != shape or not bool(torch.isfinite(torch.as_tensor(a).float()).all()):
+            bad.append(f"{label}: final.{k}")
+    return bad
+
+
+def check_clamp(ref: dict, cand: dict, ref_sha: str) -> list[str]:
+    """B2 candidate (schema already checked): every planned forward's future = (1-s)*R_final + s*own initial noise,
+    frame 0 = own first frame; final future = R future; meta names R's sha."""
     bad = []
-    sched = cand["meta"]["schedule"]
-    exe = executed_steps(sched)
-    idx = [int(s["i"]) for s in cand["steps"]]
-    if idx != exe:
-        bad.append(f"step indices {idx} != executed {exe}")
+    ntt = PLAN["num_train_timesteps"]
+    if [int(x["i"]) for x in cand.get("steps", [])] != PLAN["executed_steps"]:
+        return ["clamp: candidate forwards do not cover the frozen plan"]
     tgt, eps = ref["final"]["video_latents"], cand["init"]["video_noise"]
     ff = cand["cond"]["first_frame_latents"]
-    for s in cand["steps"]:
-        z = s["video_latents_in"]
-        if not _finite(z):
-            bad.append(f"non-finite@{s['i']}")
-        if abs(float(s["t_v"]) - float(sched[int(s["i"])][0])) > 0:
-            bad.append(f"t_v@{s['i']}")
-        sigma = float(s["t_v"]) / ntt
+    for x in cand["steps"]:
+        z = x["video_latents_in"]
+        sigma = float(PLAN["schedule"][int(x["i"])][0]) / ntt
         exp = ((1.0 - sigma) * tgt[:, :, 1:].float() + sigma * eps[:, :, 1:].float()).to(z.dtype)
         if not torch.equal(z[:, :, 1:], exp):
-            bad.append(f"future@{s['i']}")
+            bad.append(f"future@{x['i']}")
         if not torch.equal(z[:, :, : ff.shape[2]], ff.to(z.dtype)):
-            bad.append(f"frame0@{s['i']}")
+            bad.append(f"frame0@{x['i']}")
     fin = cand["final"]["video_latents"]
     if not torch.equal(fin[:, :, 1:], tgt[:, :, 1:].to(fin.dtype)):
         bad.append("final future != target")
@@ -204,7 +241,8 @@ def _state(rec: dict) -> dict:
 
 
 def validate_episodes(stage: str, q_receipt: dict, grid: list[dict], backend_manifest_sha: str,
-                      scientific_bundle_sha: str | None, local_backend: bool, receipt_path: Path) -> dict:
+                      scientific_bundle_sha: str | None, local_backend: bool, receipt_path: Path,
+                      stage_stop_reason: str | None = None) -> dict:
     n_seeds = TARGET["Q_eng" if stage == "M2" else "Q_eval"]
     seeds = q_receipt.get("accepted_scene_seeds", [])
     problems, exercised = [], {"B1": 0, "B2": 0}
@@ -293,9 +331,9 @@ def validate_episodes(stage: str, q_receipt: dict, grid: list[dict], backend_man
                 if e1 or e2:
                     problems.append(f"ordinal {o} {arm}: {e1 or e2}"); continue
                 sd = RECOVERY_SEEDS[x["correction_index"]]
-                if (ref["meta"]["video_seed"], ref["meta"]["action_seed"]) != sd["ref"] or \
-                        (cand["meta"]["video_seed"], cand["meta"]["action_seed"]) != sd["cand"]:
-                    problems.append(f"ordinal {o} {arm}: recovery seeds differ from the frozen map")
+                schema = check_trace(ref, sd["ref"], f"{arm} R") + check_trace(cand, sd["cand"], f"{arm} cand")
+                if schema:
+                    problems.append(f"ordinal {o} {arm}: trace schema {schema[:4]}"); continue
                 if not (torch.equal(ref["cond"]["first_frame_latents"], cand["cond"]["first_frame_latents"])
                         and torch.equal(torch.as_tensor(ref["cond"]["proprio"]), torch.as_tensor(cand["cond"]["proprio"]))):
                     problems.append(f"ordinal {o} {arm}: R and candidate conditions differ (state advanced)")
@@ -309,18 +347,24 @@ def validate_episodes(stage: str, q_receipt: dict, grid: list[dict], backend_man
                     problems.append(f"ordinal {o} B1: candidate unexpectedly clamped/replayed")
                 exercised[arm] += 1
                 if x["correction_index"] == 0:
-                    refs[arm] = ref["final"]["video_latents"]
-        if "B1" in refs and "B2" in refs and not torch.equal(refs["B1"], refs["B2"]):
-            problems.append(f"ordinal {o}: first reference proposal R differs between B1 and B2")
+                    refs[arm] = (ref["final"]["video_latents"], cand["init"]["video_noise"], cand["init"]["action_noise"])
+        if "B1" in refs and "B2" in refs:
+            if not torch.equal(refs["B1"][0], refs["B2"][0]):
+                problems.append(f"ordinal {o}: first reference proposal R differs between B1 and B2")
+            if not (torch.equal(refs["B1"][1], refs["B2"][1]) and torch.equal(refs["B1"][2], refs["B2"][2])):
+                problems.append(f"ordinal {o}: B1/B2 candidates do not share the frozen candidate noise")
     complete = sum(1 for c in grid if c.get("status") == "ran" and c.get("rc") == 0 and c.get("fetch_ok"))
     body = {"stage": stage, "backend_manifest_sha256": backend_manifest_sha, "scientific_bundle_sha256": scientific_bundle_sha,
             "q_manifest_sha256": q_receipt.get("manifest_sha256"), "complete_episodes": complete, "grid": rows,
-            "recovery_invocations_exercised": exercised, "problems": problems}
+            "recovery_invocations_exercised": exercised, "problems": problems,
+            "stage_status": "complete" if (stage_stop_reason is None and complete == len(expected)) else "incomplete",
+            "stage_stop_reason": stage_stop_reason}
     if stage == "M2":
         body["common_prefix_pass"] = not any(("prefix" in p) or ("trigger" in p and "differs" in p) for p in problems)
         body["invariants_pass"] = not problems
         body["recovery_path_exercised"] = exercised["B1"] > 0 and exercised["B2"] > 0
-        body["engineering_pass"] = complete == 9 and not problems and body["recovery_path_exercised"]
+        body["engineering_pass"] = (complete == 9 and not problems and body["recovery_path_exercised"]
+                                    and stage_stop_reason is None)
     else:
         body["engineering_pass"] = None  # M3: descriptive run; this is its all-N completeness/integrity record
     return write_receipt(receipt_path, body)
