@@ -388,7 +388,7 @@ class JointInferenceEngine(BaseInferenceEngine):
 
     # --- G0 probe (research hook; inert unless a request carries ``probe``) ---
 
-    _PROBE_KEYS = {"trace_path", "video_seed", "action_seed", "replay_trace_path", "replay_mode"}
+    _PROBE_KEYS = {"trace_path", "video_seed", "action_seed", "replay_trace_path", "replay_mode", "clamp_target_trace_path"}
 
     def _probe_root(self) -> str:
         probe_cfg = getattr(self.cfg, "probe", None)
@@ -456,6 +456,23 @@ class JointInferenceEngine(BaseInferenceEngine):
                 "sha256": _sha256_file(replay_path),
                 "mode": replay_mode,
             }
+        clamp_path = probe.get("clamp_target_trace_path")
+        if clamp_path is not None:
+            # Recovery B2: future frames clamped to a fixed target (the final video latents of a trace written
+            # earlier in the same request), re-noised with this call's own seeded noise inside generate().
+            if replay_mode is not None:
+                raise ValueError("probe clamp_target_trace_path cannot be combined with replay")
+            if self._dit_cache is not None:
+                raise ValueError("probe clamp requires optimization.dit_cache.enabled=false")
+            real = os.path.realpath(clamp_path)
+            if not real.startswith(self._probe_root() + os.sep):
+                raise ValueError(f"probe clamp_target_trace_path {clamp_path!r} is outside probe root")
+            src = torch.load(real, map_location="cpu", weights_only=False)
+            target = (src.get("final") or {}).get("video_latents") if isinstance(src, dict) else None
+            if target is None:
+                raise ValueError(f"clamp target trace {clamp_path!r} has no final.video_latents")
+            arch_probe["clamp_target"] = target
+            arch_probe["_clamp_source"] = {"path": real, "sha256": _sha256_file(real)}
         if arch_probe:
             kwargs["probe"] = arch_probe
         return kwargs
@@ -497,6 +514,8 @@ class JointInferenceEngine(BaseInferenceEngine):
                 "replay_mode": replay_source["mode"] if replay_source else None,
                 "replay_source_path": replay_source["path"] if replay_source else None,
                 "replay_source_sha256": replay_source["sha256"] if replay_source else None,
+                "clamp_source_path": (arch_probe.get("_clamp_source") or {}).get("path"),
+                "clamp_source_sha256": (arch_probe.get("_clamp_source") or {}).get("sha256"),
                 "request": dict(probe_request),
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             },

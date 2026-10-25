@@ -227,8 +227,14 @@ class ModelClient:
         self._step = 0
         self._probe_capture = None
         if probe_dir:
-            from benchmarks.robotwin.probe_capture import ProbeCapture
-            self._probe_capture = ProbeCapture(probe_dir, video_seed=probe_video_seed, action_seed=probe_action_seed)
+            recovery_arm = os.environ.get("ROBOTWIN_RECOVERY_ARM")
+            if recovery_arm:
+                from benchmarks.robotwin.recovery_capture import RecoveryCapture
+                self._probe_capture = RecoveryCapture(probe_dir, arm=recovery_arm, video_seed=probe_video_seed,
+                                                      action_seed=probe_action_seed)
+            else:
+                from benchmarks.robotwin.probe_capture import ProbeCapture
+                self._probe_capture = ProbeCapture(probe_dir, video_seed=probe_video_seed, action_seed=probe_action_seed)
 
         self._ws_url = f"ws://{host}:{port}"
         self._client = WSPolicyClient(self._ws_url, timeout=request_timeout)

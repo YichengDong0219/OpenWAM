@@ -462,13 +462,26 @@ def _install_manifest(module) -> None:
     def build_manifest(task_name, task_env, args, model, st_seed, test_num=100, video_size=None, instruction_type=None):
         del model, video_size
         accepted = []
+        # Recovery qualification runs one candidate per invocation: ROBOTWIN_START_SEED picks the candidate
+        # (must lie at/after the official st_seed), ROBOTWIN_MAX_CANDIDATES=1 bounds the scan.
+        if os.environ.get("ROBOTWIN_START_SEED") is not None:
+            start = int(os.environ["ROBOTWIN_START_SEED"])
+            if start < st_seed:
+                raise ValueError(f"ROBOTWIN_START_SEED {start} precedes official st_seed {st_seed}")
+            st_seed = start
         now_seed = st_seed
         progress_path = Path(os.environ["ROBOTWIN_PROGRESS_FILE"])
 
         args["eval_mode"] = True
         task_env.suc = 0
         task_env.test_num = 0
+        max_candidates = os.environ.get("ROBOTWIN_MAX_CANDIDATES")
         while len(accepted) < test_num:
+            if max_candidates is not None and now_seed - st_seed >= int(max_candidates):
+                write_progress(progress_path, {"completed": len(accepted), "total": test_num,
+                                               "candidate_seed": now_seed - 1, "exhausted": True})
+                raise RuntimeError(f"qualification candidate cap {max_candidates} exhausted with "
+                                   f"{len(accepted)}/{test_num} accepted (first candidate {st_seed})")
             render_freq = args["render_freq"]
             args["render_freq"] = 0
             domain = GlobalRngDomain.from_seed(now_seed)
@@ -734,7 +747,7 @@ def _configure_labtasker(argv: list[str]) -> argparse.Namespace:
         task_name=args.task,
         task_config=args.mode,
         ckpt_setting="openwam",
-        seed=0,
+        seed=int(os.environ.get("ROBOTWIN_SEED_PARAM", "0")),  # official st_seed = 100000 * (1 + seed)
         policy_name="openwam2robotwin_interface",
     )
     if args.operation == "run_eval":

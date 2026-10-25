@@ -64,7 +64,12 @@ class SyncInferenceExecutor:
 
     def _generate_and_enqueue(self, conditions: dict):
         """Run inference and keep only the executable action horizon."""
-        result = self.engine.generate(conditions)
+        probe = conditions.get("probe")
+        recovery = probe.get("recovery") if isinstance(probe, dict) else None
+        if recovery is not None:
+            result = self._recovery_generate(conditions, recovery)
+        else:
+            result = self.engine.generate(conditions)
         actions = result["actions"]
         if hasattr(actions, "cpu"):
             actions = actions.detach().cpu().numpy()
@@ -86,6 +91,42 @@ class SyncInferenceExecutor:
         }
         if result.get("probe_receipt") is not None:
             self._last_generation["probe_receipt"] = result["probe_receipt"]
+        if result.get("recovery_receipt") is not None:
+            self._last_generation["recovery_receipt"] = result["recovery_receipt"]
+
+    _RECOVERY_KEYS = {"arm", "ref_trace_path", "ref_video_seed", "ref_action_seed",
+                      "cand_trace_path", "cand_video_seed", "cand_action_seed"}
+
+    def _recovery_generate(self, conditions: dict, recovery: dict) -> dict:
+        """Recovery arms B1/B2: two full generations from the SAME conditions, no action executed in between.
+
+        1. reference proposal R (recorded, seeds ref_*); its actions are never executed;
+        2. candidate (recorded, seeds cand_*): B1 = ordinary joint generation; B2 = future frames clamped to R's
+           final video latents, re-noised with the candidate's own seeded noise at every executed step.
+        Only the candidate's actions are enqueued. Both arms spend exactly two generations."""
+        if not isinstance(recovery, dict) or set(recovery) != self._RECOVERY_KEYS:
+            raise ValueError(f"recovery request must have exactly {sorted(self._RECOVERY_KEYS)}")
+        if recovery["arm"] not in ("B1", "B2"):
+            raise ValueError(f"recovery arm must be B1 or B2; got {recovery['arm']!r}")
+        if set(conditions["probe"]) != {"recovery"}:
+            raise ValueError("a recovery probe must not carry other probe fields")
+        base = {k: v for k, v in conditions.items() if k != "probe"}
+        ref = self.engine.generate({**base, "probe": {"trace_path": recovery["ref_trace_path"],
+                                                      "video_seed": int(recovery["ref_video_seed"]),
+                                                      "action_seed": int(recovery["ref_action_seed"])}})
+        if ref.get("probe_receipt") is None:
+            raise RuntimeError("recovery reference generation wrote no trace")
+        cand_probe = {"trace_path": recovery["cand_trace_path"], "video_seed": int(recovery["cand_video_seed"]),
+                      "action_seed": int(recovery["cand_action_seed"])}
+        if recovery["arm"] == "B2":
+            cand_probe["clamp_target_trace_path"] = ref["probe_receipt"]["trace_path"]
+        cand = self.engine.generate({**base, "probe": cand_probe})
+        if cand.get("probe_receipt") is None:
+            raise RuntimeError("recovery candidate generation wrote no trace")
+        cand = dict(cand)
+        cand["recovery_receipt"] = {"arm": recovery["arm"], "ref": ref["probe_receipt"],
+                                    "cand": cand["probe_receipt"], "n_generations": 2}
+        return cand
 
     def reset(self):
         """Clear state between episodes."""

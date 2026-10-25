@@ -1,0 +1,107 @@
+{
+  "format": "recovery-resource-policy/1",
+  "status": "Codex_R86_fixed_caps_Claude_may_accept_unchanged_then_use",
+  "user_authorization": {
+    "uuid": "ad32dd83-c761-4ccc-98ad-bc3541cf4285",
+    "timestamp": "2026-10-25T15:51:04.118Z",
+    "scope": "execute converged v1 autonomously; local3090 deployment or bounded remote idle-GPU waiting"
+  },
+  "release_anchor_utc": "2026-10-25T16:09:29+00:00",
+  "deadline_utc": "2026-10-28T16:09:29+00:00",
+  "deadline_Asia_Shanghai": "2026-10-29T00:09:29+08:00",
+  "deadline_scope": "all waiting and GPU work ends by this fixed deadline, no rolling extension; runtime timeout includes cleanup within deadline",
+  "stage_caps_card_seconds": {
+    "V": 3600,
+    "Q_eng": 3600,
+    "Q_eval": 14400,
+    "M2": 10800,
+    "M3": 54000
+  },
+  "global_cap_card_seconds": 86400,
+  "global_cap_card_hours": 24,
+  "qualification_candidate_caps": {
+    "Q_eng": 30,
+    "Q_eval": 200
+  },
+  "qualification_targets": {
+    "Q_eng": 3,
+    "Q_eval": 20
+  },
+  "qualification_start_scene_seeds": {
+    "Q_eng": 200000,
+    "Q_eval": 300000
+  },
+  "invocation_caps": {
+    "V": 2,
+    "Q_eng": 30,
+    "Q_eval": 200,
+    "M2": 9,
+    "M3": 60
+  },
+  "per_invocation_cap_seconds": {
+    "V": 1800,
+    "Q_eng": 240,
+    "Q_eval": 240,
+    "M2": 2700,
+    "M3": 2700
+  },
+  "kill_grace_seconds": 60,
+  "execution_topology": "one allocated GPU at a time; no phase concurrency; job-owned server/planner on same allocation; if it cannot fit do not use a second unbudgeted GPU",
+  "accounting": "reserve full allowed invocation time durably before load, deduct actual monotonic wall*allocated unique GPUs including failed starts/initialization/idle server/cleanup; release unused reservation after verified own-process cleanup; no reset on restart",
+  "admission_free_MiB": {
+    "remote_48GB": 26624,
+    "local_3090": 22528
+  },
+  "local_min_observed_free_MiB_during_full_stack": 2048,
+  "local_memory_note": "24GiB=24576MiB; V model-only is provisional, M2 must verify model+planner/simulator coexistence and allocator/global memory evidence; sampled peaks not continuous proof",
+  "validation_candidates": [
+    "local_3090_offload_once",
+    "remote_reference_once"
+  ],
+  "validation_reference": {
+    "production_seal_sha256": "22ab20fe58dc69b03b15f47e248ab71f49cb734e6afddcee846e86fdd93c3462",
+    "obs_id": "hanging_mug_ep0000_chunk0002",
+    "condition": "C0",
+    "video_seed": 1001,
+    "action_seed": 2001,
+    "manifest_sha256": "1c569bc6eb7551b043060efc2e9dc1a35dba0fc9bac0d32d03f8097bc3208231"
+  },
+  "validation_auto_tolerance": {
+    "initial_video_action_noise": "bitwise equal",
+    "first_frame_and_mask_and_schedule": "exact equal",
+    "all10step_video_action_inputs_and_velocities": "bitwise equal",
+    "full_final_normalized_and_physical_actions": "bitwise equal, finite; ignore timestamps/path/device labels only",
+    "repeat": "same request twice, both match immutable reference; do not replace reference with local outputs",
+    "nonzero_tolerance": "not auto-approved; log residuals and fall back to remote candidate once, never widen acceptance based on observed drift",
+    "prompt": "prefer original GPU encoding before offload; CPU prompt encoding may change arithmetic and is not presumed equivalent"
+  },
+  "backend_selection": "V can attempt local once then remote once if needed; choose one validated backend manifest for Q/M2/M3; same host/backend/GPU allocation for an episode and all compared arms, no local/remote pooling or silent backend change",
+  "wait": {
+    "interval_seconds": 600,
+    "maximum_slots": 432,
+    "query_timeout_seconds": 20,
+    "on_unknown": "record error, no admission; next scheduled slot only",
+    "on_deadline": "stop and report not_run/incomplete; no retries/extension",
+    "scope": "user-authorized resource waiting only, never restart P1B or conversation watchers"
+  },
+  "joint_bundle_required_for": [
+    "Q_eng",
+    "M2",
+    "Q_eval",
+    "M3"
+  ],
+  "joint_bundle_scope": "one exact cross-reviewed M0 threshold + M1 controller/seed selector + runtime/input + validators + policy bundle; stages advance by pinned validator receipts, no per-stage user approval",
+  "stage_order": [
+    "V",
+    "Q_eng",
+    "M2",
+    "Q_eval",
+    "M3"
+  ],
+  "M2_promotion": "engineering validity only, never rescue/success effect or best condition",
+  "V_conditions": "unchanged reviewed generation path and pinned reference/source/config/weights with residency-only engineering change, full provenance; new sampler/model logic requires review before run",
+  "retries": "no invocation reruns or directory replacement; all failures consume cap; process/engineering failure halts stage, do not select another seed to hide it",
+  "partial": "if qualification lacks target or M2 incomplete stop; M3 cap/deadline produces incomplete all-N report with missing rows, no silent complete-case replacement",
+  "P1B_active": false,
+  "training_IDM_new_expert_recovery_M0b_runs_authorized": false
+}

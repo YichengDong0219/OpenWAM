@@ -1497,6 +1497,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 inputs_shared[key] = value
         # G0 probe: the raw initial video latents before the first-frame overwrite.
         probe_video_noise = _probe_cpu(inputs_shared["latents"]) if (probe and probe.get("record")) else None
+        # Recovery B2: clamp the future video frames to a fixed target at every executed step,
+        # target re-noised with THIS call's own seeded initial noise (P1A clamp_latents semantics).
+        if probe and probe.get("clamp_target") is not None:
+            probe = self._clamp_target_probe(probe, schedule, inputs_shared["latents"], num_frames, action_num_frames)
         ref_latents = inputs_shared.get("first_frame_latents")
         if ref_latents is not None:
             latents = inputs_shared["latents"].clone()
@@ -1731,6 +1735,44 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 "replay_window": None if replay_window is None else sorted(replay_window),
             }
         return result
+
+    def _clamp_target_probe(self, probe: dict, schedule, raw_latents: Tensor, num_frames: int, action_num_frames: int) -> dict:
+        """Translate ``probe['clamp_target']`` into an ordinary full-schedule replay.
+
+        For each executed step i: z_i = raw.clone(); z_i[:, :, 1:] = (1 - s_i) * target[:, :, 1:] + s_i * raw[:, :, 1:],
+        s_i = t_v,i / num_train_timesteps, where ``raw`` is this call's seeded initial video latents before the
+        first-frame overwrite (identical to a recorded trace's init.video_noise). Frame 0 is overwritten with the
+        live first-frame latents by the replay path. The final latents are the target (frame 0 live)."""
+        if probe.get("replay_video_steps") is not None:
+            raise ValueError("probe clamp_target and replay_video_steps are mutually exclusive")
+        target = probe["clamp_target"]
+        if tuple(target.shape) != tuple(raw_latents.shape):
+            raise ValueError(f"clamp_target shape {tuple(target.shape)} != live {tuple(raw_latents.shape)}")
+        n_train = float(self.video_scheduler.num_train_timesteps)
+        raw = raw_latents.detach()
+        tgt = target.to(device=raw.device)
+        steps, t_vs = {}, {}
+        for i in range(len(schedule) - 1):
+            t_v, t_a = schedule[i]
+            if (t_v, t_a) == tuple(schedule[i + 1]):
+                continue
+            sigma = float(t_v) / n_train
+            if not (0.0 <= sigma <= 1.0):
+                raise ValueError(f"clamp sigma {sigma} outside [0,1] at step {i}")
+            z = raw.clone()
+            z[:, :, 1:] = ((1.0 - sigma) * tgt[:, :, 1:].float() + sigma * raw[:, :, 1:].float()).to(raw.dtype)
+            steps[i] = z
+            t_vs[i] = float(t_v)
+        out = {k: v for k, v in probe.items() if k != "clamp_target"}
+        out.update({
+            "replay_video_steps": steps,
+            "replay_t_v": t_vs,
+            "replay_schedule": [(float(a), float(b)) for a, b in schedule],
+            "replay_meta": {"num_frames": int(num_frames), "action_num_frames": int(action_num_frames)},
+            "replay_active_mask": None,
+            "replay_video_final": tgt.to(raw.dtype).clone(),
+        })
+        return out
 
     @staticmethod
     def _check_probe_replay(schedule, probe: dict, live_latents: Tensor) -> None:

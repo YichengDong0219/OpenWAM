@@ -237,6 +237,8 @@ class PolicyServer:
             response["generation"] = self._serialize_generation(generation)
             if generation.get("probe_receipt") is not None:
                 response["probe"] = generation["probe_receipt"]
+            if generation.get("recovery_receipt") is not None:
+                response["recovery"] = generation["recovery_receipt"]
         return response
 
     @staticmethod
