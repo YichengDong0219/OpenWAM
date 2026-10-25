@@ -1,0 +1,41 @@
+{
+ "format": "recovery-scientific-protocol/1",
+ "plan": "RECOVERY_MINIMAL_PLAN_V1.md (Codex R85) with Codex R86 policy ba90fd66 and R87 review fixes",
+ "task": "hanging_mug", "mode": "demo_randomized", "instruction_type": "unseen",
+ "execution_horizon_H": 32,
+ "trigger": {
+  "kind": "simulator-privileged stall trigger (NOT a deployable visual detector)",
+  "evaluated": "only when a new chunk is about to be generated, from fully executed earlier chunks",
+  "full_window": "complete, termination none, executed_count == inference_horizon == 32, post_obs offsets 4..32, finite fields",
+  "K": 2, "eps_m": 0.01,
+  "range": "max pairwise Euclidean distance of mug_functional_point over all samples (chunk start + 4-step post_obs) of the last K full windows",
+  "phase_gate": "closing-attempt proxy: right_gripper <= 0.1 at some sample of an earlier chunk; no grasp/contact claim",
+  "grip_open": "right_gripper >= 0.9 at the last sample of the last chunk",
+  "not_success": "official hanging_mug geometric target: |mug_fp - (rack_pose.p + rack_fp)/2|_xy < 0.02 each and mug z > 0.86",
+  "selection_note": "phase gate and thresholds chosen in-sample on the 5 old G0 episodes (ep1/ep2 trigger, ep0/3/4 not); no generalisation claim",
+  "m0_evidence": "evidence/recovery_M0_claude_v2/m0_mug_v2.json"
+ },
+ "arms": {
+  "B0": "original policy; trigger logged only",
+  "B1": "at a trigger the next chunk = reference proposal R (executed never) + ordinary joint candidate; candidate executed",
+  "B2": "same R; candidate future frames clamped at every executed denoising step to (1-s)*R_final + s*own seeded noise, frame 0 live; candidate executed"
+ },
+ "generations_per_correction": 2,
+ "max_corrections_per_episode": 2, "cooldown_normal_chunks": 2,
+ "seeds": {"normal_chunks": "engine default 42 (as G0)",
+           "correction_0": {"ref": [1001, 2001], "cand": [3001, 4001]},
+           "correction_1": {"ref": [1002, 2002], "cand": [3002, 4002]}},
+ "qualification": {"official": "st_seed = 100000*(1+seed_param), expert_check, one candidate per invocation, contiguous",
+                   "rejected_reasons_registered": ["expert_plan_fail", "expert_success_false", "unstable"],
+                   "anything_else": "infra -> stop the stage",
+                   "Q_eng": {"seed_param": 1, "start": 200000, "target": 3, "max_candidates": 30},
+                   "Q_eval": {"seed_param": 2, "start": 300000, "target": 20, "max_candidates": 200}},
+ "arm_order": "per ordinal i: rotation[i % 3] with rotation = (B0,B1,B2),(B1,B2,B0),(B2,B0,B1); sealed with the manifest",
+ "M2": {"cells": 9, "promotion": "engineering only (complete cells, common prefix, trigger state, receipts, clamp, terminal logs, memory, ledger); recovery path must be exercised by >=1 B1 and >=1 B2 correction else engineering incomplete; never success/rescue counts"},
+ "M3": {"N": 20, "cells": 60, "primary": "all-N paired official success-rate difference B2 - B1",
+        "secondary": ["B1 - B0", "B2 - B0", "per-seed outcomes and win/loss counts"],
+        "rescue": "B0 failure and arm success / number of B0 failures d; d=0 -> NA; d in 1..3 reported as k/d, flagged too small for stability claims",
+        "harm": "B0 success and arm failure / number of B0 successes",
+        "missing": "not_run / incomplete cells kept in all-N tables with sensitivity; no seed replacement, no extension, no complete-case substitution",
+        "no_p_values": true}
+}

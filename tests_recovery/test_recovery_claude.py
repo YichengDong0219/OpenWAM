@@ -146,14 +146,14 @@ def test_trigger_reproduces_m0_on_g0():
     for p in recs:
         d = json.loads(p.read_text())
         by_ep.setdefault(d["episode"], []).append(d)
-    m0 = json.loads((Path("/newhome/dongyicheng/robotwin_probe_dialogue/evidence/recovery_M0_claude/m0_mug_states.json")).read_text())
+    m0 = json.loads(Path("/newhome/dongyicheng/robotwin_probe_dialogue/evidence/recovery_M0_claude_v2/m0_mug_v2.json").read_text())
     for ep, rs in by_ep.items():
         rs.sort(key=lambda d: d["chunk"])
         online = [n for n in range(1, len(rs) + 1) if m.mug_stall_trigger(rs[:n])["trigger"]]
-        m0_trig = [r["chunk"] for r in m0["episodes"][f"hanging_mug_ep{ep}"]["rows"] if r["trigger_candidate"]]
-        # online decision before chunk n uses completed chunks < n, i.e. M0's trigger at chunk n-1
-        assert online == [c + 1 for c in m0_trig if c + 1 <= len(rs)], (ep, online, m0_trig)
-    assert not any(m.mug_stall_trigger(by_ep[e][:n])["trigger"] for e in (0, 3, 4) for n in range(1, len(by_ep[e]) + 1))
+        assert online == m0["episodes"][f"hanging_mug_ep{ep}"]["online_trigger_before_chunks"], (ep, online)
+    firsts = {ep: next((n for n in range(1, len(rs) + 1) if m.mug_stall_trigger(rs[:n])["trigger"]), None)
+              for ep, rs in by_ep.items()}
+    assert firsts == {0: None, 1: 12, 2: 20, 3: None, 4: None}, firsts  # Codex R87 independent recomputation
 
 
 def test_request_flow_cooldown_and_cap():

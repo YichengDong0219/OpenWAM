@@ -31,8 +31,20 @@ def chunk_samples(record: dict) -> list[dict]:
 
 
 def mug_geometric_success(tf: dict) -> bool:
-    m, r = tf["mug_functional_point"][:3], tf["rack_functional_point"][:3]
-    return abs(m[0] - r[0]) < 0.02 and abs(m[1] - r[1]) < 0.02 and m[2] > 0.86
+    """Geometric part of hanging_mug.check_success: |mug - (rack_pose.p + rack_functional_point)/2|_xy < 0.02 each,
+    mug z > 0.86 (the right-gripper-open part of the official check is not included)."""
+    m = tf["mug_functional_point"][:3]
+    mid = [(a + b) / 2 for a, b in zip(tf["rack_pose"]["p"], tf["rack_functional_point"][:3])]
+    return abs(m[0] - mid[0]) < 0.02 and abs(m[1] - mid[1]) < 0.02 and m[2] > 0.86
+
+
+def full_window(record: dict) -> bool:
+    """Only complete, fully executed 32-step chunks with all 4-step observations count as trigger windows."""
+    return (record.get("complete") is True and record.get("termination") == "none"
+            and int(record.get("executed_count", -1)) == int(record.get("inference_horizon", -2)) == 32
+            and [p["offset"] for p in record.get("post_obs", [])] == list(range(4, 33, 4))
+            and all(math.isfinite(v) for s in chunk_samples(record)
+                    for v in [*s["mug_functional_point"][:3], s["right_gripper"]]))
 
 
 def mug_stall_trigger(completed: list[dict], params: dict = TRIGGER_DEFAULTS) -> dict:
@@ -40,14 +52,19 @@ def mug_stall_trigger(completed: list[dict], params: dict = TRIGGER_DEFAULTS) ->
 
     completed: fully executed chunk records of this episode, in order. With c = the last completed chunk:
       range  = max pairwise distance of the mug functional point over all samples of the last K chunks;
-      phase  = the right gripper was <= closed at some sample of chunks before c (the hang attempt has started;
-               hanging_mug first moves the mug with the other arm, so a lift-based gate fires in that handoff pause);
+      phase  = closing-attempt proxy: the right gripper was <= closed at some sample of chunks before c (says nothing
+               about a successful grasp/contact; hanging_mug first moves the mug with the other arm, so a lift-based
+               gate fires in that normal handoff pause); both of the last K chunks must be full windows;
       open   = right gripper >= open at the last sample of c;
       not geometric success at the last sample of c.
     """
     k = int(params["K"])
-    diag = {"n_completed": len(completed), "range_m": None, "phase": False, "grip_open": False, "geom_success": None}
+    diag = {"n_completed": len(completed), "range_m": None, "phase": False, "grip_open": False, "geom_success": None,
+            "windows_full": None}
     if len(completed) < k:
+        return {"trigger": False, **diag}
+    diag["windows_full"] = all(full_window(r) for r in completed[-k:])
+    if not diag["windows_full"]:
         return {"trigger": False, **diag}
     samples = [s for rec in completed[-k:] for s in chunk_samples(rec)]
     pts = [s["mug_functional_point"][:3] for s in samples]

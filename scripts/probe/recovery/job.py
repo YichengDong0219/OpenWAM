@@ -86,8 +86,12 @@ def spawn(cmd, env, stream, **kw) -> subprocess.Popen:
     p = subprocess.Popen(cmd, env=env, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True, **kw)
     CHILDREN.append(p)
     if PIDS_FILE is not None:
+        try:
+            st0 = Path(f"/proc/{p.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        except (OSError, IndexError):
+            st0 = "unknown"
         with open(PIDS_FILE, "a") as f:
-            f.write(f"{p.pid}\n")
+            f.write(f"{p.pid} {st0}\n")
     return p
 
 
@@ -193,7 +197,7 @@ def main() -> int:
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=False)
     global PIDS_FILE
-    PIDS_FILE = a.out / "pgids.txt"
+    PIDS_FILE = Path(os.environ["JOB_PGIDS"]) if os.environ.get("JOB_PGIDS") else a.out / "pgids.txt"
     signal.signal(signal.SIGTERM, lambda *x: (kill_children(), sys.exit(143)))
     t0 = time.time()
     rc = qualify(a) if a.cmd == "qualify" else episode(a)
