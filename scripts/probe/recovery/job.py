@@ -120,6 +120,10 @@ def run(cmd, env, log: Path) -> int:
 
 def qualify(a) -> int:
     out = a.out
+    origin = import_origin(os.environ["ROBOTWIN_PYTHON"], base_env(out))
+    (out / "import_origin.json").write_text(json.dumps({"ROBOTWIN_PYTHON": origin}))
+    if not origin or not all(Path(x).resolve().is_relative_to(ROOT) for x in origin.splitlines()):
+        raise SystemExit(f"runtime imports outside {ROOT}: {origin}")
     env = dict(base_env(out), ROBOTWIN_PROBE_ROOT=str(out), ROBOTWIN_SEED_PARAM=str(a.seed_param),
                ROBOTWIN_START_SEED=str(a.start_seed), ROBOTWIN_MAX_CANDIDATES="1")
     rc = run(wrapper_cmd(["--operation", "build_manifest", "--total-episodes", "1", "--result-file",
@@ -128,9 +132,18 @@ def qualify(a) -> int:
     return rc
 
 
+def import_origin(python: str, env: dict) -> str:
+    return subprocess.run([python, "-c", "import openwam, benchmarks; print(openwam.__file__); print(benchmarks.__file__)"],
+                          env=env, cwd=ROOT, capture_output=True, text=True, timeout=120).stdout.strip()
+
+
 def episode(a) -> int:
     out = a.out
     env = base_env(out)
+    origins = {py: import_origin(os.environ[py], env) for py in ("OPENWAM_PYTHON", "ROBOTWIN_PYTHON")}
+    (out / "import_origin.json").write_text(json.dumps(origins))
+    if not all(o and all(Path(x).resolve().is_relative_to(ROOT) for x in o.splitlines()) for o in origins.values()):
+        raise SystemExit(f"runtime imports outside {ROOT}: {origins}")
     manifest = json.loads(Path(a.manifest).read_text())
     total = len(manifest["entries"])
     sampler = MemSampler(out / "gpu_mem.csv")

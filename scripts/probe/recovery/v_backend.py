@@ -76,6 +76,11 @@ def main() -> int:
         if sha_file(p) != h:
             res.update(engineering_pass=False, error=f"{label} sha mismatch")
             (a.out / "v_result.json").write_text(json.dumps(res, indent=1)); return 2
+    import openwam
+    res["openwam_import"] = str(Path(openwam.__file__).resolve())
+    if not Path(openwam.__file__).resolve().is_relative_to(ROOT):
+        res.update(engineering_pass=False, error=f"openwam imported from {openwam.__file__}, not {ROOT}")
+        (a.out / "v_result.json").write_text(json.dumps(res, indent=1)); return 2
     from offline_runner import OfflineRunner, load_trace
     src = load_trace(a.source_trace)
     ref = torch.load(a.reference, map_location="cpu", weights_only=False)

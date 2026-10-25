@@ -159,7 +159,8 @@ class Executor:
         run_id = f"{phase}-{st['attempted_invocations'][phase] + 1:03d}-{uuid.uuid4().hex[:10]}"
         jobdir = f"{host['probe_root']}/recovery_jobs/{run_id}"
         spec = {"token": uuid.uuid4().hex, "argv": [a.replace("{RUN_ID}", run_id) for a in job_argv],
-                "env": {**host["env"], "CUDA_VISIBLE_DEVICES": adm["chosen"]["index"], "RECOVERY_RUN_ID": run_id},
+                "env": {**host["env"], "CUDA_VISIBLE_DEVICES": adm["chosen"]["index"], "RECOVERY_RUN_ID": run_id,
+                        "PYTHONPATH": f"{host['repo']}:{host['repo']}/benchmarks/robotwin"},
                 "work_seconds": work, "kill_grace_seconds": grace, "cleanup_seconds": CLEANUP_S, "repo": host["repo"],
                 "expect": host["expect"], "log_path": f"{jobdir}/job.log", "status_path": f"{jobdir}/status.json"}
         (self.root / "specs").mkdir(exist_ok=True)

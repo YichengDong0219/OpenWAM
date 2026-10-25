@@ -35,8 +35,12 @@ out["openwam"] = {"head": run(["git", "rev-parse", "HEAD"], ROOT).strip(),
                   "dirty": run(["git", "status", "--porcelain", "--untracked-files=no"], ROOT).strip(),
                   "tracked_digest": hashlib.sha256(run(["git", "ls-files", "-s"], ROOT).encode()).hexdigest(),
                   "assets_link": os.path.realpath(ROOT / "assets")}
-out["checkpoint"] = tree(ROOT / "assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-RoboTwin-Full")
-out["video_backbone_ckpt"] = tree(ROOT / "assets/video_backbone_ckpt")
+for key, rel in (("checkpoint", "assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Sim-RoboTwin-Full"),
+                 ("video_backbone_ckpt", "assets/video_backbone_ckpt")):
+    out[key] = tree(ROOT / rel)
+    out[key + "_realpath"] = os.path.realpath(ROOT / rel)
+    if not out[key]:
+        out["errors"].append({"cmd": [key], "rc": "empty", "stderr": f"no files under {rel}"})
 rt = Path(os.environ["ROBOTWIN_PATH"])
 out["robotwin"] = {"path": str(rt), "head": run(["git", "rev-parse", "HEAD"], rt).strip(),
                    "dirty": run(["git", "status", "--porcelain", "--untracked-files=no"], rt).strip(),
